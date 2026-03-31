@@ -31,6 +31,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Auto-create tables on startup if DATABASE_URL is available
+try:
+    from setup_db import ensure_tables
+    ensure_tables()
+except Exception as _setup_err:
+    import logging as _log
+    _log.getLogger(__name__).warning(f"DB setup skipped: {_setup_err}")
+
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
@@ -69,9 +77,12 @@ active_jobs: dict[int, dict] = {}
 
 def get_profile() -> dict | None:
     """Return the latest parsed resume profile from Supabase."""
-    result = get_supabase().table("profile").select("parsed").order("updated_at", desc=True).limit(1).execute()
-    if result.data:
-        return result.data[0]["parsed"]
+    try:
+        result = get_supabase().table("profile").select("parsed").order("updated_at", desc=True).limit(1).execute()
+        if result.data:
+            return result.data[0]["parsed"]
+    except Exception as e:
+        logger.error(f"get_profile error: {e}")
     return None
 
 
