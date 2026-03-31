@@ -1,0 +1,19 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    command: python tools/telegram_bot.py
+
+  cron:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    # Runs process_jobs.py every weekday at 9:00 UTC
+    # Uses supercronic for reliable cron inside Docker
+    command: >
+      sh -c "
+        echo '0 9 * * 1-5 python /app/tools/process_jobs.py >> /var/log/cron.log 2>&1'
+        > /etc/crontabs/root &&
+        crond -f -l 2
+      "
