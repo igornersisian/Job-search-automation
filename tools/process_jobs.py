@@ -2,7 +2,7 @@
 Daily pipeline orchestrator.
 
 Flow:
-  1. Run Apify search → get job list
+  1. Run Apify LinkedIn + Glassdoor searches → merge job lists
   2. For each job:
      a. Deduplicate via Supabase
      b. Filter internship/junior
@@ -26,7 +26,8 @@ from dotenv import load_dotenv
 
 # Import sibling tools
 sys.path.insert(0, os.path.dirname(__file__))
-from run_apify_search import run_search
+from run_apify_search import run_search as run_linkedin_search
+from run_glassdoor_search import run_search as run_glassdoor_search
 from score_job import score_job, is_junior_or_intern
 from notify_telegram import send_job_card, send_daily_summary
 
@@ -95,16 +96,20 @@ def save_job(job: dict, status: str) -> None:
 # ---------------------------------------------------------------------------
 
 def normalise_job(raw: dict) -> dict:
-    """Map Apify actor output fields to our standard schema."""
+    """Map Apify actor output fields to our standard schema.
+    Glassdoor jobs are already normalised by run_glassdoor_search.py,
+    so we only remap LinkedIn-style fields when the canonical ones are missing.
+    """
     return {
         "id": raw.get("id") or raw.get("jobId") or raw.get("trackingUrn", ""),
         "title": raw.get("title") or raw.get("jobTitle", ""),
         "company": raw.get("company") or raw.get("companyName", ""),
-        "url": raw.get("jobUrl") or raw.get("url", ""),
+        "url": raw.get("url") or raw.get("jobUrl", ""),
         "salary": raw.get("salary") or raw.get("salaryText", ""),
         "description": raw.get("description") or raw.get("jobDescription", ""),
         "location": raw.get("location") or raw.get("locationText", ""),
         "postedAt": raw.get("postedAt") or raw.get("publishedAt"),
+        "source": raw.get("source", "linkedin"),
     }
 
 
@@ -121,15 +126,32 @@ def run_pipeline() -> None:
         logger.error("No resume profile in Supabase. Send PDF to Telegram bot first.")
         return
 
-    # Fetch jobs from Apify
-    logger.info("Fetching jobs from Apify...")
+    # Fetch jobs from LinkedIn and Glassdoor in sequence
+    raw_jobs: list[dict] = []
+
+    logger.info("Fetching jobs from LinkedIn (Apify)...")
     try:
-        raw_jobs = run_search()
+        linkedin_jobs = run_linkedin_search()
+        for job in linkedin_jobs:
+            job.setdefault("source", "linkedin")
+        raw_jobs.extend(linkedin_jobs)
+        logger.info(f"LinkedIn: {len(linkedin_jobs)} jobs")
     except Exception as e:
-        logger.error(f"Apify search failed: {e}")
+        logger.error(f"LinkedIn search failed: {e}")
+
+    logger.info("Fetching jobs from Glassdoor (Apify)...")
+    try:
+        glassdoor_jobs = run_glassdoor_search()
+        raw_jobs.extend(glassdoor_jobs)
+        logger.info(f"Glassdoor: {len(glassdoor_jobs)} jobs")
+    except Exception as e:
+        logger.error(f"Glassdoor search failed: {e}")
+
+    if not raw_jobs:
+        logger.error("No jobs fetched from any source.")
         return
 
-    logger.info(f"Fetched {len(raw_jobs)} raw jobs from Apify")
+    logger.info(f"Total raw jobs: {len(raw_jobs)}")
 
     sent = 0
     skipped_dupe = 0
