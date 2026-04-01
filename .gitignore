@@ -1,2 +1,7 @@
 .env
+__pycache__/
+*.pyc
+.tmp/
 Igor_Nersisian_CV.pdf
+credentials.json
+token.json

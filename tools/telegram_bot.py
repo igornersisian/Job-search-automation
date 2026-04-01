@@ -15,7 +15,7 @@ import io
 import json
 import logging
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 
 import httpx
 from openai import OpenAI
@@ -437,6 +437,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ---------------------------------------------------------------------------
+# Scheduled daily pipeline (replaces cron container)
+# ---------------------------------------------------------------------------
+
+async def scheduled_pipeline(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run the daily job search pipeline on schedule."""
+    logger.info("Scheduled daily pipeline triggered")
+
+    def run_pipeline_sync():
+        sys.path.insert(0, os.path.dirname(__file__))
+        from process_jobs import run_pipeline
+        run_pipeline()
+
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, run_pipeline_sync)
+        logger.info("Scheduled pipeline finished")
+    except Exception as e:
+        logger.error(f"Scheduled pipeline failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -451,6 +472,15 @@ def main() -> None:
     app.add_handler(CommandHandler("job", cmd_job))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Daily pipeline: weekdays at 09:00 UTC
+    app.job_queue.run_daily(
+        scheduled_pipeline,
+        time=dt_time(hour=9, minute=0, tzinfo=timezone.utc),
+        days=(0, 1, 2, 3, 4),  # Mon-Fri
+        name="daily_job_search",
+    )
+    logger.info("Scheduled daily pipeline for weekdays 09:00 UTC")
 
     logger.info("Bot started (long-polling)")
     app.run_polling(drop_pending_updates=True)
