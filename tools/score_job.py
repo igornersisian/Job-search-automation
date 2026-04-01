@@ -43,12 +43,9 @@ JUNIOR_KEYWORDS = [
 
 
 def is_junior_or_intern(job: dict) -> bool:
-    """Return True if job should be filtered as internship/junior."""
-    text = " ".join([
-        job.get("title", ""),
-        job.get("description", ""),
-    ]).lower()
-    return any(kw in text for kw in JUNIOR_KEYWORDS)
+    """Return True if job title indicates internship/junior role."""
+    title = job.get("title", "").lower()
+    return any(kw in title for kw in JUNIOR_KEYWORDS)
 
 
 def score_job(job: dict, profile: dict) -> dict:
@@ -73,8 +70,16 @@ def score_job(job: dict, profile: dict) -> dict:
             {
                 "role": "system",
                 "content": (
-                    "You are a career advisor evaluating job fit for a candidate. "
-                    "Analyze the job posting against the candidate profile and return a JSON object with:\n"
+                    "You are a career advisor evaluating job fit for a candidate.\n\n"
+                    "CRITICAL RULES:\n"
+                    "- Use ONLY facts explicitly stated in the candidate profile. "
+                    "Do NOT infer, assume, or invent any details about the candidate's experience, "
+                    "years of work, skills, or projects that are not written in the profile.\n"
+                    "- If something is not mentioned in the profile, treat it as absent — "
+                    "do not guess or extrapolate.\n"
+                    "- When citing candidate experience in red_flags or match_summary, "
+                    "quote the actual profile data.\n\n"
+                    "Return a JSON object with:\n"
                     "- score: int 0-100 (how well the candidate fits this role)\n"
                     "- match_summary: string (1-2 sentences on why this is or isn't a good fit)\n"
                     "- red_flags: list of strings (concerns, missing requirements, or mismatches)\n"
