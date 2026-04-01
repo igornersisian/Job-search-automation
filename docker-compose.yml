@@ -10,11 +10,12 @@ services:
     restart: unless-stopped
     env_file: .env
     # Runs process_jobs.py every weekday at 9:00 UTC
-    # Uses supercronic for reliable cron inside Docker
+    # env vars are dumped to /app/.cronenv so cron jobs can source them
     command: >
       sh -c "
+        env | grep -E '^(OPENAI_|APIFY_|TELEGRAM_|SUPABASE_|DATABASE_)' > /app/.cronenv &&
         mkdir -p /var/spool/cron/crontabs &&
-        printf '0 9 * * 1-5 python /app/tools/process_jobs.py >> /var/log/cron.log 2>&1\n'
+        printf '0 9 * * 1-5 . /app/.cronenv; python /app/tools/process_jobs.py >> /var/log/cron.log 2>&1\n'
         > /var/spool/cron/crontabs/root &&
         chmod 600 /var/spool/cron/crontabs/root &&
         cron -f

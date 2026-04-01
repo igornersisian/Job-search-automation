@@ -23,17 +23,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+def _telegram_api() -> str:
+    return f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}"
 
 
 def send_message(text: str, parse_mode: str = "Markdown") -> dict:
     """Send a text message to the configured chat."""
     resp = httpx.post(
-        f"{TELEGRAM_API}/sendMessage",
+        f"{_telegram_api()}/sendMessage",
         json={
-            "chat_id": TELEGRAM_CHAT_ID,
+            "chat_id": os.environ["TELEGRAM_CHAT_ID"],
             "text": text,
             "parse_mode": parse_mode,
             "disable_web_page_preview": True,
@@ -44,16 +43,23 @@ def send_message(text: str, parse_mode: str = "Markdown") -> dict:
     return resp.json()
 
 
+def _esc_md(text: str) -> str:
+    """Escape Telegram Markdown v1 special characters."""
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 def format_job_card(job: dict) -> str:
     """Format a job dict into a Telegram message."""
     score = job.get("score", 0)
     score_emoji = "✅" if score >= 80 else "🟡" if score >= 70 else "🔴"
 
-    title = job.get("title", "Unknown Position")
-    company = job.get("company", "Unknown Company")
+    title = _esc_md(job.get("title", "Unknown Position"))
+    company = _esc_md(job.get("company", "Unknown Company"))
     url = job.get("url", job.get("jobUrl", ""))
-    salary = job.get("salary", job.get("salaryText", "Not listed"))
-    match_summary = job.get("match_summary", "")
+    salary = _esc_md(job.get("salary", job.get("salaryText", "Not listed")) or "Not listed")
+    match_summary = _esc_md(job.get("match_summary", ""))
     red_flags = job.get("red_flags", [])
     typical_qa = job.get("typical_qa", [])
 
@@ -71,15 +77,14 @@ def format_job_card(job: dict) -> str:
         lines.append("")
         lines.append("*Red flags:*")
         for flag in red_flags[:3]:
-            lines.append(f"⚠️ {flag}")
+            lines.append(f"⚠️ {_esc_md(flag)}")
 
     if typical_qa:
         lines.append("")
         lines.append("*Prep Q&A:*")
         for qa in typical_qa[:3]:
-            q = qa.get("question", "")
-            a = qa.get("answer", "")
-            # Truncate long answers
+            q = _esc_md(qa.get("question", ""))
+            a = _esc_md(qa.get("answer", ""))
             if len(a) > 200:
                 a = a[:200] + "..."
             lines.append(f"*Q:* {q}")

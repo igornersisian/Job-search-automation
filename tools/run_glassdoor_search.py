@@ -24,8 +24,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-APIFY_TOKEN = os.environ["APIFY_API_TOKEN"]
 ACTOR_ID = "QWGmrJFfdRhAzjZVu"  # silentflow/glassdoor-jobs-scraper-ppr
+
+
+def _get_token() -> str:
+    return os.environ["APIFY_API_TOKEN"]
 
 SEARCH_KEYWORDS = [
     "n8n automation",
@@ -48,18 +51,20 @@ ACTOR_INPUT = {
 
 def run_actor() -> str:
     url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
-    params = {"token": APIFY_TOKEN}
+    params = {"token": _get_token()}
     logger.info("Starting Glassdoor actor run...")
     resp = httpx.post(url, json=ACTOR_INPUT, params=params, timeout=30)
+    if resp.status_code >= 400:
+        logger.error(f"Glassdoor actor start failed ({resp.status_code}): {resp.text[:500]}")
     resp.raise_for_status()
     run_id = resp.json()["data"]["id"]
     logger.info(f"Glassdoor actor run started: {run_id}")
     return run_id
 
 
-def wait_for_run(run_id: str, timeout_seconds: int = 300) -> str:
+def wait_for_run(run_id: str, timeout_seconds: int = 600) -> str:
     url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    params = {"token": APIFY_TOKEN}
+    params = {"token": _get_token()}
     deadline = time.time() + timeout_seconds
 
     while time.time() < deadline:
@@ -83,7 +88,7 @@ def wait_for_run(run_id: str, timeout_seconds: int = 300) -> str:
 
 def fetch_dataset(dataset_id: str) -> list[dict]:
     url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-    params = {"token": APIFY_TOKEN, "format": "json", "clean": "true"}
+    params = {"token": _get_token(), "format": "json", "clean": "true"}
     logger.info(f"Downloading Glassdoor dataset {dataset_id}...")
     resp = httpx.get(url, params=params, timeout=60)
     resp.raise_for_status()

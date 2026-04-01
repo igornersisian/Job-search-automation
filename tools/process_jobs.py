@@ -19,7 +19,7 @@ import os
 import sys
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -74,7 +74,7 @@ def save_job(job: dict, status: str) -> None:
     """Insert job record into Supabase."""
     get_supabase().table("jobs").upsert({
         "id": job.get("id") or job.get("jobId") or job.get("url", "")[:200],
-        "source": "linkedin",
+        "source": job.get("source", "linkedin"),
         "title": job.get("title", ""),
         "company": job.get("company", ""),
         "url": job.get("url") or job.get("jobUrl", ""),
@@ -87,7 +87,7 @@ def save_job(job: dict, status: str) -> None:
         "red_flags": json.dumps(job.get("red_flags", [])),
         "typical_qa": json.dumps(job.get("typical_qa", [])),
         "status": status,
-        "created_at": datetime.utcnow().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }).execute()
 
 
@@ -96,19 +96,19 @@ def save_job(job: dict, status: str) -> None:
 # ---------------------------------------------------------------------------
 
 def normalise_job(raw: dict) -> dict:
-    """Map Apify actor output fields to our standard schema.
-    Glassdoor jobs are already normalised by run_glassdoor_search.py,
-    so we only remap LinkedIn-style fields when the canonical ones are missing.
+    """Pass through already-normalised fields from source scrapers.
+    Both run_apify_search and run_glassdoor_search normalise their output,
+    so this just ensures required keys exist with sensible defaults.
     """
     return {
-        "id": raw.get("id") or raw.get("jobId") or raw.get("trackingUrn", ""),
-        "title": raw.get("title") or raw.get("jobTitle", ""),
-        "company": raw.get("company") or raw.get("companyName", ""),
-        "url": raw.get("url") or raw.get("jobUrl", ""),
-        "salary": raw.get("salary") or raw.get("salaryText", ""),
-        "description": raw.get("description") or raw.get("jobDescription", ""),
-        "location": raw.get("location") or raw.get("locationText", ""),
-        "postedAt": raw.get("postedAt") or raw.get("publishedAt"),
+        "id": raw.get("id", ""),
+        "title": raw.get("title", ""),
+        "company": raw.get("company", ""),
+        "url": raw.get("url", ""),
+        "salary": raw.get("salary", ""),
+        "description": raw.get("description", ""),
+        "location": raw.get("location", ""),
+        "postedAt": raw.get("postedAt"),
         "source": raw.get("source", "linkedin"),
     }
 
@@ -132,8 +132,6 @@ def run_pipeline() -> None:
     logger.info("Fetching jobs from LinkedIn (Apify)...")
     try:
         linkedin_jobs = run_linkedin_search()
-        for job in linkedin_jobs:
-            job.setdefault("source", "linkedin")
         raw_jobs.extend(linkedin_jobs)
         logger.info(f"LinkedIn: {len(linkedin_jobs)} jobs")
     except Exception as e:

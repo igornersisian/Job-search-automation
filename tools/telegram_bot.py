@@ -15,8 +15,7 @@ import io
 import json
 import logging
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 from openai import OpenAI
@@ -94,7 +93,7 @@ def save_profile(raw_text: str, parsed: dict) -> None:
         "id": 1,
         "raw_text": raw_text,
         "parsed": parsed,
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }).execute()
 
 
@@ -275,7 +274,7 @@ async def cmd_fetch_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         from process_jobs import run_pipeline
         run_pipeline()
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(None, run_pipeline_sync)
         await msg.edit_text("Pipeline finished. Check above for job cards and the daily summary.")

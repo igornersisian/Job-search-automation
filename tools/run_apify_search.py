@@ -1,18 +1,14 @@
 """
-Trigger Apify LinkedIn Jobs Scraper and return the dataset ID.
+Trigger Apify LinkedIn Jobs Scraper and return normalised job list.
 
-Actor: curious_coder/linkedin-jobs-scraper
-Docs:  https://console.apify.com/actors/hKByXkMQaC5Qt9UMN
+Actor: cheap_scraper/linkedin-job-scraper
+Docs:  https://console.apify.com/actors/2rJKkhh7vjpX7pvjg
 
 Usage:
     python tools/run_apify_search.py
-    → prints dataset_id to stdout
-
-Returns dataset_id so process_jobs.py can download results.
 """
 
 import os
-import sys
 import json
 import time
 import logging
@@ -28,11 +24,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-APIFY_TOKEN = os.environ["APIFY_API_TOKEN"]
-ACTOR_ID = "hKByXkMQaC5Qt9UMN"  # curious_coder/linkedin-jobs-scraper
+ACTOR_ID = "2rJKkhh7vjpX7pvjg"  # cheap_scraper/linkedin-job-scraper
 
-# Search queries — multiple runs, results merged
-SEARCH_QUERIES = [
+
+def _get_token() -> str:
+    return os.environ["APIFY_API_TOKEN"]
+
+
+SEARCH_KEYWORDS = [
     "AI workflow",
     "n8n",
     "automation engineer",
@@ -44,34 +43,34 @@ SEARCH_QUERIES = [
 ]
 
 ACTOR_INPUT = {
-    "queries": SEARCH_QUERIES,
-    "location": "Worldwide",
-    "remote": True,
-    "datePosted": "past24Hours",
-    "limit": 20,  # per query, total ~120 results
-    "proxy": {"useApifyProxy": True},
+    "keyword": SEARCH_KEYWORDS,
+    "publishedAt": "r86400",          # last 24 hours
+    "workType": ["remote"],
+    "maxItems": 150,
+    "saveOnlyUniqueItems": True,
 }
 
 
 def run_actor() -> str:
     """Start the Apify actor run and return run_id."""
     url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
-    headers = {"Content-Type": "application/json"}
-    params = {"token": APIFY_TOKEN}
+    params = {"token": _get_token()}
 
-    logger.info("Starting Apify actor run...")
-    resp = httpx.post(url, json=ACTOR_INPUT, params=params, headers=headers, timeout=30)
+    logger.info("Starting LinkedIn actor run...")
+    resp = httpx.post(url, json=ACTOR_INPUT, params=params, timeout=30)
+    if resp.status_code >= 400:
+        logger.error(f"LinkedIn actor start failed ({resp.status_code}): {resp.text[:500]}")
     resp.raise_for_status()
 
     run_id = resp.json()["data"]["id"]
-    logger.info(f"Actor run started: {run_id}")
+    logger.info(f"LinkedIn actor run started: {run_id}")
     return run_id
 
 
-def wait_for_run(run_id: str, timeout_seconds: int = 300) -> str:
+def wait_for_run(run_id: str, timeout_seconds: int = 600) -> str:
     """Poll until the run is SUCCEEDED, return dataset_id."""
     url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    params = {"token": APIFY_TOKEN}
+    params = {"token": _get_token()}
     deadline = time.time() + timeout_seconds
 
     while time.time() < deadline:
@@ -82,40 +81,59 @@ def wait_for_run(run_id: str, timeout_seconds: int = 300) -> str:
 
         if status == "SUCCEEDED":
             dataset_id = data["defaultDatasetId"]
-            logger.info(f"Run succeeded. Dataset ID: {dataset_id}")
+            logger.info(f"LinkedIn run succeeded. Dataset: {dataset_id}")
             return dataset_id
         elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
-            raise RuntimeError(f"Actor run {run_id} ended with status: {status}")
+            raise RuntimeError(f"LinkedIn actor run {run_id} ended with status: {status}")
 
-        logger.info(f"Run status: {status}. Waiting...")
+        logger.info(f"LinkedIn run status: {status}. Waiting...")
         time.sleep(10)
 
-    raise TimeoutError(f"Actor run {run_id} did not finish within {timeout_seconds}s")
+    raise TimeoutError(f"LinkedIn actor run {run_id} did not finish within {timeout_seconds}s")
 
 
 def fetch_dataset(dataset_id: str) -> list[dict]:
     """Download all items from an Apify dataset."""
     url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-    params = {"token": APIFY_TOKEN, "format": "json", "clean": "true"}
+    params = {"token": _get_token(), "format": "json", "clean": "true"}
 
-    logger.info(f"Downloading dataset {dataset_id}...")
+    logger.info(f"Downloading LinkedIn dataset {dataset_id}...")
     resp = httpx.get(url, params=params, timeout=60)
     resp.raise_for_status()
 
     items = resp.json()
-    logger.info(f"Downloaded {len(items)} items from dataset")
+    logger.info(f"Downloaded {len(items)} LinkedIn jobs")
     return items
 
 
+def normalise_linkedin(raw: dict) -> dict:
+    """Map cheap_scraper/linkedin-job-scraper output to the shared job schema."""
+    salary_info = raw.get("salaryInfo") or []
+    salary_text = " - ".join(salary_info) if salary_info else ""
+
+    return {
+        "id": raw.get("jobId", ""),
+        "title": raw.get("jobTitle", ""),
+        "company": raw.get("companyName", ""),
+        "url": raw.get("jobUrl") or raw.get("applyUrl", ""),
+        "salary": salary_text,
+        "description": raw.get("jobDescription", ""),
+        "location": raw.get("location", ""),
+        "postedAt": raw.get("publishedAt") or raw.get("postedTime", ""),
+        "is_remote": "remote" in (raw.get("workType") or "").lower(),
+        "source": "linkedin",
+    }
+
+
 def run_search() -> list[dict]:
-    """Full flow: trigger → wait → fetch. Returns list of job dicts."""
+    """Full flow: trigger -> wait -> fetch -> normalise. Returns list of job dicts."""
     run_id = run_actor()
     dataset_id = wait_for_run(run_id)
-    return fetch_dataset(dataset_id)
+    raw_items = fetch_dataset(dataset_id)
+    return [normalise_linkedin(item) for item in raw_items]
 
 
 if __name__ == "__main__":
     jobs = run_search()
-    # Print dataset contents as JSON for piping to process_jobs.py
     print(json.dumps(jobs, ensure_ascii=False, indent=2))
-    logger.info(f"Done. {len(jobs)} jobs fetched.")
+    logger.info(f"Done. {len(jobs)} LinkedIn jobs fetched.")
