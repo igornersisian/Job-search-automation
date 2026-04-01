@@ -88,13 +88,39 @@ def get_profile() -> dict | None:
 
 
 def save_profile(raw_text: str, parsed: dict) -> None:
-    """Upsert resume profile in Supabase (single row, id=1)."""
+    """Upsert resume profile in Supabase (single row, id=1).
+    Preserves search_keywords if they already exist in the profile.
+    """
+    existing = get_profile()
+    if existing and "search_keywords" in existing:
+        parsed["search_keywords"] = existing["search_keywords"]
     get_supabase().table("profile").upsert({
         "id": 1,
         "raw_text": raw_text,
         "parsed": parsed,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).execute()
+
+
+def get_search_keywords() -> list[str] | None:
+    """Return custom search keywords from profile, or None if not set."""
+    profile = get_profile()
+    if profile:
+        return profile.get("search_keywords")
+    return None
+
+
+def save_search_keywords(keywords: list[str]) -> None:
+    """Save search keywords into the profile's parsed JSONB."""
+    profile = get_profile()
+    if not profile:
+        logger.error("No profile found — upload resume first")
+        return
+    profile["search_keywords"] = keywords
+    get_supabase().table("profile").update({
+        "parsed": profile,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", 1).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +138,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 def parse_resume_with_openai(raw_text: str) -> dict:
     """Use OpenAI to extract structured profile from resume text."""
     response = get_openai().chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1-mini",
         response_format={"type": "json_object"},
         messages=[
             {
@@ -183,7 +209,7 @@ def scrape_job_page(url: str) -> str:
 def analyze_job_with_openai(job_text: str, profile: dict) -> dict:
     """Analyze a job posting against the user's profile."""
     response = get_openai().chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1-mini",
         response_format={"type": "json_object"},
         messages=[
             {
@@ -231,14 +257,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Commands:*\n"
         "/help — this message\n"
         "/status — show your current profile summary\n"
+        "/keywords — set search keywords (comma-separated)\n"
         "/fetch\\_jobs — manually run the job search pipeline now\n"
         "/job <url> — analyze a specific job URL and set it as active context\n\n"
         "*How to use:*\n"
         "1. Send your resume PDF — I'll parse and remember it\n"
-        "2. Every morning I'll send you matching job cards\n"
-        "3. After seeing a card, ask me anything: \"What to write for cover letter?\", "
-        "\"What to answer to 'describe your experience with n8n'?\" etc.\n"
-        "4. Use /job <url> to load any job for discussion",
+        "2. Set keywords: /keywords AI workflow, n8n, automation\n"
+        "3. Every morning I'll send you matching job cards\n"
+        "4. After seeing a card, ask me anything\n"
+        "5. Use /job <url> to load any job for discussion",
         parse_mode="Markdown",
     )
 
@@ -262,6 +289,37 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"*Projects:* {len(profile.get('projects', []))}"
         f"{active_info}",
         parse_mode="Markdown",
+    )
+
+
+async def cmd_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set or show search keywords."""
+    if not context.args:
+        # Show current keywords
+        kw = get_search_keywords()
+        if kw:
+            await update.message.reply_text(
+                f"*Current keywords:*\n{', '.join(kw)}\n\n"
+                "To change: /keywords AI workflow, n8n, automation",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "No custom keywords set. Using defaults.\n"
+                "To set: /keywords AI workflow, n8n, automation"
+            )
+        return
+
+    raw_text = " ".join(context.args)
+    keywords = [kw.strip() for kw in raw_text.split(",") if kw.strip()]
+
+    if not keywords:
+        await update.message.reply_text("Send keywords separated by commas: /keywords AI workflow, n8n, automation")
+        return
+
+    save_search_keywords(keywords)
+    await update.message.reply_text(
+        f"Search keywords saved ({len(keywords)}):\n" + ", ".join(keywords)
     )
 
 
@@ -422,7 +480,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         response = get_openai().chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4.1",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
@@ -468,6 +526,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("keywords", cmd_keywords))
     app.add_handler(CommandHandler("fetch_jobs", cmd_fetch_jobs))
     app.add_handler(CommandHandler("job", cmd_job))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))

@@ -33,19 +33,21 @@ def get_openai() -> OpenAI:
         _openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     return _openai_client
 
-# Keywords that indicate internship or clearly junior roles — filter these out
-JUNIOR_KEYWORDS = [
-    "intern", "internship", "entry level", "entry-level",
-    "no experience required", "0-1 year", "0 to 1 year",
-    "fresh graduate", "recent graduate", "graduate program",
-    "junior developer", "junior engineer",
+# Only filter actual internships/trainee positions — not entry-level or junior
+INTERN_KEYWORDS = [
+    "intern",
+    "internship",
+    "trainee",
+    "graduate program",
+    "apprentice",
+    "apprenticeship",
 ]
 
 
 def is_junior_or_intern(job: dict) -> bool:
-    """Return True if job title indicates internship/junior role."""
+    """Return True if job title indicates an internship/trainee position."""
     title = job.get("title", "").lower()
-    return any(kw in title for kw in JUNIOR_KEYWORDS)
+    return any(kw in title for kw in INTERN_KEYWORDS)
 
 
 def score_job(job: dict, profile: dict) -> dict:
@@ -64,7 +66,7 @@ def score_job(job: dict, profile: dict) -> dict:
     profile_text = json.dumps(profile, indent=2)
 
     response = get_openai().chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1-mini",
         response_format={"type": "json_object"},
         messages=[
             {

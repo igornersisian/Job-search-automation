@@ -41,6 +41,17 @@ logger = logging.getLogger(__name__)
 
 SCORE_THRESHOLD = 70
 
+DEFAULT_KEYWORDS = [
+    "AI workflow",
+    "n8n",
+    "automation engineer",
+    "no-code automation engineer",
+    "AI automation engineer",
+    "workflow automation",
+    "AI agent developer",
+    "vibe coding developer",
+]
+
 _supabase: Client | None = None
 
 
@@ -126,12 +137,16 @@ def run_pipeline() -> None:
         logger.error("No resume profile in Supabase. Send PDF to Telegram bot first.")
         return
 
+    # Use custom keywords from profile if set, otherwise defaults
+    keywords = profile.get("search_keywords") or DEFAULT_KEYWORDS
+    logger.info(f"Search keywords ({len(keywords)}): {keywords}")
+
     # Fetch jobs from LinkedIn and Glassdoor in sequence
     raw_jobs: list[dict] = []
 
     logger.info("Fetching jobs from LinkedIn (Apify)...")
     try:
-        linkedin_jobs = run_linkedin_search()
+        linkedin_jobs = run_linkedin_search(keywords)
         raw_jobs.extend(linkedin_jobs)
         logger.info(f"LinkedIn: {len(linkedin_jobs)} jobs")
     except Exception as e:
@@ -139,7 +154,7 @@ def run_pipeline() -> None:
 
     logger.info("Fetching jobs from Glassdoor (Apify)...")
     try:
-        glassdoor_jobs = run_glassdoor_search()
+        glassdoor_jobs = run_glassdoor_search(keywords)
         raw_jobs.extend(glassdoor_jobs)
         logger.info(f"Glassdoor: {len(glassdoor_jobs)} jobs")
     except Exception as e:

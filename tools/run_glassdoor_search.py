@@ -30,30 +30,19 @@ ACTOR_ID = "QWGmrJFfdRhAzjZVu"  # silentflow/glassdoor-jobs-scraper-ppr
 def _get_token() -> str:
     return os.environ["APIFY_API_TOKEN"]
 
-SEARCH_KEYWORDS = [
-    "n8n automation",
-    "no-code automation engineer",
-    "AI automation engineer",
-    "workflow automation developer",
-    "AI agent developer",
-]
-
-ACTOR_INPUT = {
-    "keywords": SEARCH_KEYWORDS,
-    "remoteWorkType": "true",
-    "jobType": "fulltime",
-    "fromAge": "1",       # posted today
-    "maxItems": 100,
-    "seniorityType": "midseniorlevel",
-    "proxy": {"useApifyProxy": True},
-}
-
-
-def run_actor() -> str:
+def run_actor(keywords: list[str]) -> str:
     url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
     params = {"token": _get_token()}
-    logger.info("Starting Glassdoor actor run...")
-    resp = httpx.post(url, json=ACTOR_INPUT, params=params, timeout=30)
+    actor_input = {
+        "keywords": keywords,
+        "remoteWorkType": "true",
+        "jobType": "fulltime",
+        "fromAge": "1",       # posted today
+        "maxItems": 100,
+        "proxy": {"useApifyProxy": True},
+    }
+    logger.info(f"Starting Glassdoor actor run with {len(keywords)} keywords...")
+    resp = httpx.post(url, json=actor_input, params=params, timeout=30)
     if resp.status_code >= 400:
         logger.error(f"Glassdoor actor start failed ({resp.status_code}): {resp.text[:500]}")
     resp.raise_for_status()
@@ -128,9 +117,9 @@ def normalise_glassdoor(raw: dict) -> dict:
     }
 
 
-def run_search() -> list[dict]:
+def run_search(keywords: list[str]) -> list[dict]:
     """Full flow: trigger → wait → fetch → normalise. Returns list of job dicts."""
-    run_id = run_actor()
+    run_id = run_actor(keywords)
     dataset_id = wait_for_run(run_id)
     raw_items = fetch_dataset(dataset_id)
     return [normalise_glassdoor(item) for item in raw_items]

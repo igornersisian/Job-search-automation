@@ -31,33 +31,20 @@ def _get_token() -> str:
     return os.environ["APIFY_API_TOKEN"]
 
 
-SEARCH_KEYWORDS = [
-    "AI workflow",
-    "n8n",
-    "automation engineer",
-    "no-code automation engineer",
-    "AI automation engineer",
-    "workflow automation",
-    "AI agent developer",
-    "vibe coding developer",
-]
-
-ACTOR_INPUT = {
-    "keyword": SEARCH_KEYWORDS,
-    "publishedAt": "r86400",          # last 24 hours
-    "workType": ["remote"],
-    "maxItems": 150,
-    "saveOnlyUniqueItems": True,
-}
-
-
-def run_actor() -> str:
+def run_actor(keywords: list[str]) -> str:
     """Start the Apify actor run and return run_id."""
     url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
     params = {"token": _get_token()}
+    actor_input = {
+        "keyword": keywords,
+        "publishedAt": "r86400",          # last 24 hours
+        "workType": ["remote"],
+        "maxItems": 150,
+        "saveOnlyUniqueItems": True,
+    }
 
-    logger.info("Starting LinkedIn actor run...")
-    resp = httpx.post(url, json=ACTOR_INPUT, params=params, timeout=30)
+    logger.info(f"Starting LinkedIn actor run with {len(keywords)} keywords...")
+    resp = httpx.post(url, json=actor_input, params=params, timeout=30)
     if resp.status_code >= 400:
         logger.error(f"LinkedIn actor start failed ({resp.status_code}): {resp.text[:500]}")
     resp.raise_for_status()
@@ -125,9 +112,9 @@ def normalise_linkedin(raw: dict) -> dict:
     }
 
 
-def run_search() -> list[dict]:
+def run_search(keywords: list[str]) -> list[dict]:
     """Full flow: trigger -> wait -> fetch -> normalise. Returns list of job dicts."""
-    run_id = run_actor()
+    run_id = run_actor(keywords)
     dataset_id = wait_for_run(run_id)
     raw_items = fetch_dataset(dataset_id)
     return [normalise_linkedin(item) for item in raw_items]
