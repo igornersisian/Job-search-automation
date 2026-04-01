@@ -2,7 +2,7 @@
 Daily pipeline orchestrator.
 
 Flow:
-  1. Run Apify LinkedIn + Glassdoor searches → merge job lists
+  1. Run Apify LinkedIn + Glassdoor + Indeed + Wellfound searches → merge job lists
   2. For each job:
      a. Deduplicate via Supabase
      b. Filter internship/junior
@@ -28,6 +28,8 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(__file__))
 from run_apify_search import run_search as run_linkedin_search
 from run_glassdoor_search import run_search as run_glassdoor_search
+from run_indeed_search import run_search as run_indeed_search
+from run_wellfound_search import run_search as run_wellfound_search
 from score_job import score_job, is_junior_or_intern
 from notify_telegram import send_job_card, send_daily_summary
 
@@ -159,6 +161,22 @@ def run_pipeline() -> None:
         logger.info(f"Glassdoor: {len(glassdoor_jobs)} jobs")
     except Exception as e:
         logger.error(f"Glassdoor search failed: {e}")
+
+    logger.info("Fetching jobs from Indeed (Apify)...")
+    try:
+        indeed_jobs = run_indeed_search(keywords)
+        raw_jobs.extend(indeed_jobs)
+        logger.info(f"Indeed: {len(indeed_jobs)} jobs")
+    except Exception as e:
+        logger.error(f"Indeed search failed: {e}")
+
+    logger.info("Fetching jobs from Wellfound (Apify)...")
+    try:
+        wellfound_jobs = run_wellfound_search(keywords, profile=profile)
+        raw_jobs.extend(wellfound_jobs)
+        logger.info(f"Wellfound: {len(wellfound_jobs)} jobs")
+    except Exception as e:
+        logger.error(f"Wellfound search failed: {e}")
 
     if not raw_jobs:
         logger.error("No jobs fetched from any source.")
