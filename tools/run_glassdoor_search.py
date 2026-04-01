@@ -50,7 +50,7 @@ def run_actor() -> str:
     url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
     params = {"token": APIFY_TOKEN}
     logger.info("Starting Glassdoor actor run...")
-    resp = httpx.post(url, json={"input": ACTOR_INPUT}, params=params, timeout=30)
+    resp = httpx.post(url, json=ACTOR_INPUT, params=params, timeout=30)
     resp.raise_for_status()
     run_id = resp.json()["data"]["id"]
     logger.info(f"Glassdoor actor run started: {run_id}")
