@@ -10,10 +10,12 @@ Capabilities:
 """
 
 import os
+import sys
 import io
 import json
 import logging
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import httpx
@@ -230,6 +232,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Commands:*\n"
         "/help — this message\n"
         "/status — show your current profile summary\n"
+        "/fetch\\_jobs — manually run the job search pipeline now\n"
         "/job <url> — analyze a specific job URL and set it as active context\n\n"
         "*How to use:*\n"
         "1. Send your resume PDF — I'll parse and remember it\n"
@@ -261,6 +264,24 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"{active_info}",
         parse_mode="Markdown",
     )
+
+
+async def cmd_fetch_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually trigger the daily job pipeline."""
+    msg = await update.message.reply_text("Starting job search pipeline... This takes a few minutes.")
+
+    def run_pipeline_sync():
+        sys.path.insert(0, os.path.dirname(__file__))
+        from process_jobs import run_pipeline
+        run_pipeline()
+
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, run_pipeline_sync)
+        await msg.edit_text("Pipeline finished. Check above for job cards and the daily summary.")
+    except Exception as e:
+        logger.error(f"fetch_jobs error: {e}")
+        await msg.edit_text(f"Pipeline failed: {e}")
 
 
 async def cmd_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -427,6 +448,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("fetch_jobs", cmd_fetch_jobs))
     app.add_handler(CommandHandler("job", cmd_job))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

@@ -13,7 +13,9 @@ services:
     # Uses supercronic for reliable cron inside Docker
     command: >
       sh -c "
-        echo '0 9 * * 1-5 python /app/tools/process_jobs.py >> /var/log/cron.log 2>&1'
-        > /etc/crontabs/root &&
-        crond -f -l 2
+        mkdir -p /var/spool/cron/crontabs &&
+        printf '0 9 * * 1-5 python /app/tools/process_jobs.py >> /var/log/cron.log 2>&1\n'
+        > /var/spool/cron/crontabs/root &&
+        chmod 600 /var/spool/cron/crontabs/root &&
+        cron -f
       "

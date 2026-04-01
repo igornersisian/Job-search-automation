@@ -33,10 +33,12 @@ ACTOR_ID = "hKByXkMQaC5Qt9UMN"  # curious_coder/linkedin-jobs-scraper
 
 # Search queries — multiple runs, results merged
 SEARCH_QUERIES = [
-    "n8n automation",
+    "AI workflow",
+    "n8n",
+    "automation engineer",
     "no-code automation engineer",
     "AI automation engineer",
-    "workflow automation developer",
+    "workflow automation",
     "AI agent developer",
     "vibe coding developer",
 ]
