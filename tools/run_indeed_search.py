@@ -31,18 +31,18 @@ def _get_token() -> str:
     return os.environ["APIFY_API_TOKEN"]
 
 
-def run_actor(keywords: list[str]) -> str:
+def run_actor(keyword: str) -> str:
+    """Start one Indeed actor run for a single keyword."""
     url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
     params = {"token": _get_token()}
-    # Indeed actor takes a single title string; join keywords with comma
     actor_input = {
-        "title": ", ".join(keywords),
+        "title": keyword,
         "country": "us",
         "location": "remote",
         "datePosted": "1",   # last 24 hours
-        "limit": 100,
+        "limit": 25,
     }
-    logger.info(f"Starting Indeed actor run with keywords: {actor_input['title'][:80]}...")
+    logger.info(f"Starting Indeed actor run: '{keyword}'")
     resp = httpx.post(url, json=actor_input, params=params, timeout=30)
     if resp.status_code >= 400:
         logger.error(f"Indeed actor start failed ({resp.status_code}): {resp.text[:500]}")
@@ -129,12 +129,33 @@ def normalise_indeed(raw: dict) -> dict:
     }
 
 
-def run_search(keywords: list[str]) -> list[dict]:
-    """Full flow: trigger -> wait -> fetch -> normalise. Returns list of job dicts."""
-    run_id = run_actor(keywords)
+def _search_one(keyword: str) -> list[dict]:
+    """Run a single keyword search end-to-end."""
+    run_id = run_actor(keyword)
     dataset_id = wait_for_run(run_id)
-    raw_items = fetch_dataset(dataset_id)
-    return [normalise_indeed(item) for item in raw_items]
+    return fetch_dataset(dataset_id)
+
+
+def run_search(keywords: list[str]) -> list[dict]:
+    """Run one Indeed search per keyword (sequentially), deduplicate results."""
+    all_jobs: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for kw in keywords:
+        try:
+            raw_items = _search_one(kw)
+            added = 0
+            for item in raw_items:
+                job = normalise_indeed(item)
+                if job["id"] and job["id"] not in seen_ids:
+                    seen_ids.add(job["id"])
+                    all_jobs.append(job)
+                    added += 1
+            logger.info(f"Indeed '{kw}': {len(raw_items)} raw, {added} new")
+        except Exception as e:
+            logger.error(f"Indeed search failed for '{kw}': {e}")
+
+    return all_jobs
 
 
 if __name__ == "__main__":

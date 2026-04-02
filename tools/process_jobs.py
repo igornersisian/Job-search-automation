@@ -2,13 +2,13 @@
 Daily pipeline orchestrator.
 
 Flow:
-  1. Run Apify LinkedIn + Glassdoor + Indeed + Wellfound searches → merge job lists
+  1. Run Apify LinkedIn + Glassdoor + Indeed + Wellfound searches IN PARALLEL
   2. For each job:
      a. Deduplicate via Supabase
      b. Filter internship/junior
-     c. Score vs resume profile
-     d. If score >= 70 → send Telegram card + save as "sent"
-     e. Else → save as "low_score"
+     c. Quick score (cheap, score-only) vs resume profile
+     d. If score >= 70 → full analysis → send Telegram card + save as "sent"
+     e. Else → save as "low_score" (no full analysis, no wasted tokens)
   3. Send daily summary to Telegram
 
 Usage:
@@ -20,6 +20,7 @@ import sys
 import json
 import logging
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -30,7 +31,7 @@ from run_apify_search import run_search as run_linkedin_search
 from run_glassdoor_search import run_search as run_glassdoor_search
 from run_indeed_search import run_search as run_indeed_search
 from run_wellfound_search import run_search as run_wellfound_search
-from score_job import score_job, is_junior_or_intern
+from score_job import score_job, quick_score, is_junior_or_intern
 from notify_telegram import send_job_card, send_daily_summary
 
 load_dotenv()
@@ -98,7 +99,7 @@ def save_job(job: dict, status: str) -> None:
         "score": job.get("score"),
         "match_summary": job.get("match_summary", ""),
         "red_flags": json.dumps(job.get("red_flags", [])),
-        "typical_qa": json.dumps(job.get("typical_qa", [])),
+        "typical_qa": "[]",
         "status": status,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }).execute()
@@ -110,7 +111,7 @@ def save_job(job: dict, status: str) -> None:
 
 def normalise_job(raw: dict) -> dict:
     """Pass through already-normalised fields from source scrapers.
-    Both run_apify_search and run_glassdoor_search normalise their output,
+    All source scrapers normalise their output,
     so this just ensures required keys exist with sensible defaults.
     """
     return {
@@ -124,6 +125,36 @@ def normalise_job(raw: dict) -> dict:
         "postedAt": raw.get("postedAt"),
         "source": raw.get("source", "linkedin"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Parallel scraper fetch
+# ---------------------------------------------------------------------------
+
+def _fetch_all_sources(keywords: list[str], profile: dict) -> list[dict]:
+    """Run all scrapers in parallel, return merged job list."""
+    raw_jobs: list[dict] = []
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_linkedin = executor.submit(run_linkedin_search, keywords)
+        future_glassdoor = executor.submit(run_glassdoor_search, keywords)
+        future_indeed = executor.submit(run_indeed_search, keywords)
+        future_wellfound = executor.submit(run_wellfound_search, keywords, profile)
+
+        for name, future in [
+            ("LinkedIn", future_linkedin),
+            ("Glassdoor", future_glassdoor),
+            ("Indeed", future_indeed),
+            ("Wellfound", future_wellfound),
+        ]:
+            try:
+                jobs = future.result()
+                raw_jobs.extend(jobs)
+                logger.info(f"{name}: {len(jobs)} jobs")
+            except Exception as e:
+                logger.error(f"{name} search failed: {e}")
+
+    return raw_jobs
 
 
 # ---------------------------------------------------------------------------
@@ -143,40 +174,8 @@ def run_pipeline() -> None:
     keywords = profile.get("search_keywords") or DEFAULT_KEYWORDS
     logger.info(f"Search keywords ({len(keywords)}): {keywords}")
 
-    # Fetch jobs from LinkedIn and Glassdoor in sequence
-    raw_jobs: list[dict] = []
-
-    logger.info("Fetching jobs from LinkedIn (Apify)...")
-    try:
-        linkedin_jobs = run_linkedin_search(keywords)
-        raw_jobs.extend(linkedin_jobs)
-        logger.info(f"LinkedIn: {len(linkedin_jobs)} jobs")
-    except Exception as e:
-        logger.error(f"LinkedIn search failed: {e}")
-
-    logger.info("Fetching jobs from Glassdoor (Apify)...")
-    try:
-        glassdoor_jobs = run_glassdoor_search(keywords)
-        raw_jobs.extend(glassdoor_jobs)
-        logger.info(f"Glassdoor: {len(glassdoor_jobs)} jobs")
-    except Exception as e:
-        logger.error(f"Glassdoor search failed: {e}")
-
-    logger.info("Fetching jobs from Indeed (Apify)...")
-    try:
-        indeed_jobs = run_indeed_search(keywords)
-        raw_jobs.extend(indeed_jobs)
-        logger.info(f"Indeed: {len(indeed_jobs)} jobs")
-    except Exception as e:
-        logger.error(f"Indeed search failed: {e}")
-
-    logger.info("Fetching jobs from Wellfound (Apify)...")
-    try:
-        wellfound_jobs = run_wellfound_search(keywords, profile=profile)
-        raw_jobs.extend(wellfound_jobs)
-        logger.info(f"Wellfound: {len(wellfound_jobs)} jobs")
-    except Exception as e:
-        logger.error(f"Wellfound search failed: {e}")
+    # Fetch jobs from all sources in parallel
+    raw_jobs = _fetch_all_sources(keywords, profile)
 
     if not raw_jobs:
         logger.error("No jobs fetched from any source.")
@@ -207,21 +206,30 @@ def run_pipeline() -> None:
             skipped_junior += 1
             continue
 
-        # Score vs profile
+        # Step 1: Quick score (cheap — score number only)
         try:
-            job = score_job(job, profile)
+            score = quick_score(job, profile)
         except Exception as e:
             logger.error(f"Scoring failed for {job['title']}: {e}")
             save_job(job, "score_error")
             continue
 
-        score = job.get("score", 0)
+        job["score"] = score
         logger.info(f"[{score}/100] {job['title']} @ {job['company']}")
 
         if score < SCORE_THRESHOLD:
             save_job(job, "low_score")
             skipped_score += 1
             continue
+
+        # Step 2: Full analysis (only for jobs above threshold)
+        try:
+            job = score_job(job, profile)
+        except Exception as e:
+            logger.error(f"Analysis failed for {job['title']}: {e}")
+            # Still send — we already have the score
+            job["match_summary"] = ""
+            job["red_flags"] = []
 
         # Send to Telegram
         if send_job_card(job):

@@ -157,11 +157,20 @@ def normalise_wellfound(raw: dict) -> dict:
         if ts:
             posted_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
+    # URL — construct from id+slug for working links
+    # Wellfound format: https://wellfound.com/jobs/{id}-{slug}
+    job_id = raw.get("id", "")
+    slug = raw.get("slug", "")
+    if job_id and slug:
+        job_url = f"https://wellfound.com/jobs/{job_id}-{slug}"
+    else:
+        job_url = raw.get("url", "")
+
     return {
-        "id": str(raw.get("id") or raw.get("url", "")[:200]),
+        "id": str(job_id or job_url[:200]),
         "title": raw.get("title", ""),
         "company": raw.get("company_name", ""),
-        "url": raw.get("url", ""),
+        "url": job_url,
         "salary": salary_text,
         "description": (raw.get("description") or "")[:5000],
         "location": location_str,

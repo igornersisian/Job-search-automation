@@ -1,7 +1,7 @@
 """
 Send a job card to Telegram.
 
-Input: enriched job dict (with score, match_summary, red_flags, typical_qa)
+Input: enriched job dict (with score, match_summary, red_flags)
 Usage:
     python tools/notify_telegram.py '<job_json>'
     or imported as a module: send_job_card(job)
@@ -59,15 +59,15 @@ def format_job_card(job: dict) -> str:
     company = _esc_md(job.get("company", "Unknown Company"))
     url = job.get("url", job.get("jobUrl", ""))
     salary = _esc_md(job.get("salary", job.get("salaryText", "Not listed")) or "Not listed")
+    source = _esc_md(job.get("source", ""))
     match_summary = _esc_md(job.get("match_summary", ""))
     red_flags = job.get("red_flags", [])
-    typical_qa = job.get("typical_qa", [])
 
     lines = [
         f"*{title}*",
         f"🏢 {company}",
         f"💰 {salary}",
-        f"🌍 Remote",
+        f"🌍 Remote" + (f" • {source}" if source else ""),
         f"Score: {score}/100 {score_emoji}",
         "",
         f"_{match_summary}_",
@@ -78,18 +78,6 @@ def format_job_card(job: dict) -> str:
         lines.append("*Red flags:*")
         for flag in red_flags[:3]:
             lines.append(f"⚠️ {_esc_md(flag)}")
-
-    if typical_qa:
-        lines.append("")
-        lines.append("*Prep Q&A:*")
-        for qa in typical_qa[:3]:
-            q = _esc_md(qa.get("question", ""))
-            a = _esc_md(qa.get("answer", ""))
-            if len(a) > 200:
-                a = a[:200] + "..."
-            lines.append(f"*Q:* {q}")
-            lines.append(f"*A:* _{a}_")
-            lines.append("")
 
     if url:
         lines.append(f"[Open job]({url})")

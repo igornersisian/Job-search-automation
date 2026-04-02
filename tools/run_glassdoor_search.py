@@ -35,11 +35,12 @@ def run_actor(keywords: list[str]) -> str:
     params = {"token": _get_token()}
     actor_input = {
         "keywords": keywords,
+        "country": "US",
+        "location": "United States",
         "remoteWorkType": "true",
         "jobType": "fulltime",
-        "fromAge": "1",       # posted today
+        "fromAge": "3",       # last 3 days
         "maxItems": 100,
-        "proxy": {"useApifyProxy": True},
     }
     logger.info(f"Starting Glassdoor actor run with {len(keywords)} keywords...")
     resp = httpx.post(url, json=actor_input, params=params, timeout=30)

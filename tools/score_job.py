@@ -2,7 +2,11 @@
 Score a single job against the user's resume profile using OpenAI.
 
 Input:  job dict (from Apify), profile dict (from Supabase)
-Output: enriched job dict with score, match_summary, red_flags, typical_qa
+Output: enriched job dict with score, match_summary, red_flags
+
+Two-step scoring:
+  1. quick_score() — returns just an int 0-100 (cheap, fast)
+  2. score_job()   — returns score + match_summary + red_flags (only for jobs above threshold)
 
 Usage (standalone):
     python tools/score_job.py '{"title": "...", "description": "..."}'
@@ -50,10 +54,46 @@ def is_junior_or_intern(job: dict) -> bool:
     return any(kw in title for kw in INTERN_KEYWORDS)
 
 
+def quick_score(job: dict, profile: dict) -> int:
+    """Fast score-only evaluation. Returns int 0-100.
+
+    Uses a compact prompt to minimise tokens — called for every job.
+    Only jobs that pass the threshold get a full score_job() call.
+    """
+    job_text = (
+        f"Title: {job.get('title', 'N/A')}\n"
+        f"Company: {job.get('company', 'N/A')}\n"
+        f"Description:\n{job.get('description', '')[:4000]}"
+    )
+    profile_text = json.dumps(profile, indent=2)
+
+    response = get_openai().chat.completions.create(
+        model="gpt-4.1-mini",
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Rate how well this candidate fits the job. "
+                    "Use ONLY facts from the profile, do not infer or assume.\n"
+                    'Return JSON: {"score": <int 0-100>}\n'
+                    "90-100: excellent match, 70-89: good, 50-69: partial, 0-49: poor."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"PROFILE:\n{profile_text}\n\nJOB:\n{job_text}",
+            },
+        ],
+    )
+    result = json.loads(response.choices[0].message.content)
+    return result.get("score", 0)
+
+
 def score_job(job: dict, profile: dict) -> dict:
     """
-    Analyze job against profile. Returns job dict enriched with:
-      score, match_summary, red_flags, typical_qa
+    Full analysis for jobs above threshold. Returns job dict enriched with:
+      score, match_summary, red_flags
     """
     job_text = (
         f"Title: {job.get('title', 'N/A')}\n"
@@ -84,10 +124,7 @@ def score_job(job: dict, profile: dict) -> dict:
                     "Return a JSON object with:\n"
                     "- score: int 0-100 (how well the candidate fits this role)\n"
                     "- match_summary: string (1-2 sentences on why this is or isn't a good fit)\n"
-                    "- red_flags: list of strings (concerns, missing requirements, or mismatches)\n"
-                    "- typical_qa: list of 3-5 objects [{question: string, answer: string}] "
-                    "  (likely application screening questions with suggested answers written "
-                    "  in first person as the candidate, based on their actual experience)\n\n"
+                    "- red_flags: list of strings (concerns, missing requirements, or mismatches)\n\n"
                     "Scoring guide:\n"
                     "90-100: Excellent match, candidate clearly qualifies\n"
                     "70-89: Good match, meets most requirements\n"
@@ -110,7 +147,6 @@ def score_job(job: dict, profile: dict) -> dict:
     job["score"] = result.get("score", 0)
     job["match_summary"] = result.get("match_summary", "")
     job["red_flags"] = result.get("red_flags", [])
-    job["typical_qa"] = result.get("typical_qa", [])
     return job
 
 
