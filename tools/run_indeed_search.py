@@ -95,7 +95,7 @@ def normalise_indeed(raw: dict) -> dict:
     if base:
         lo = base.get("min")
         hi = base.get("max")
-        currency = base.get("currencyCode", "USD")
+        currency = base.get("currencyCode") or "USD"
         unit = (base.get("unitOfWork") or "").capitalize()
         symbol = "$" if currency == "USD" else currency + " "
         if lo and hi:

@@ -231,6 +231,13 @@ def run_pipeline() -> None:
             job["match_summary"] = ""
             job["red_flags"] = []
 
+        # Re-check: full analysis may lower the score below threshold
+        if job.get("score", 0) < SCORE_THRESHOLD:
+            logger.info(f"[DROPPED] {job['title']} — full score {job['score']} < {SCORE_THRESHOLD}")
+            save_job(job, "low_score")
+            skipped_score += 1
+            continue
+
         # Send to Telegram
         if send_job_card(job):
             save_job(job, "sent")

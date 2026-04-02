@@ -1,8 +1,9 @@
 """
 Trigger Apify Glassdoor Jobs Scraper and return job list.
 
-Actor: silentflow/glassdoor-jobs-scraper-ppr
-Docs:  https://console.apify.com/actors/QWGmrJFfdRhAzjZVu
+Actor: valig/glassdoor-jobs-scraper
+ID:    5OaooRg0FxlRF0L1B
+Docs:  https://apify.com/valig/glassdoor-jobs-scraper
 
 Usage:
     python tools/run_glassdoor_search.py
@@ -12,6 +13,7 @@ import os
 import json
 import time
 import logging
+from datetime import datetime, timezone, timedelta
 
 import httpx
 from dotenv import load_dotenv
@@ -24,25 +26,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-ACTOR_ID = "QWGmrJFfdRhAzjZVu"  # silentflow/glassdoor-jobs-scraper-ppr
+ACTOR_ID = "5OaooRg0FxlRF0L1B"
 
 
 def _get_token() -> str:
     return os.environ["APIFY_API_TOKEN"]
 
-def run_actor(keywords: list[str]) -> str:
+
+def run_actor(keyword: str) -> str:
+    """Start one Glassdoor actor run for a single keyword."""
     url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
     params = {"token": _get_token()}
     actor_input = {
-        "keywords": keywords,
-        "country": "US",
+        "keywords": keyword,
         "location": "United States",
-        "remoteWorkType": "true",
-        "jobType": "fulltime",
-        "fromAge": "3",       # last 3 days
-        "maxItems": 100,
+        "daysOld": 1,
+        "limit": 25,
     }
-    logger.info(f"Starting Glassdoor actor run with {len(keywords)} keywords...")
+    logger.info(f"Starting Glassdoor actor run: '{keyword}'")
     resp = httpx.post(url, json=actor_input, params=params, timeout=30)
     if resp.status_code >= 400:
         logger.error(f"Glassdoor actor start failed ({resp.status_code}): {resp.text[:500]}")
@@ -89,44 +90,80 @@ def fetch_dataset(dataset_id: str) -> list[dict]:
 
 def normalise_glassdoor(raw: dict) -> dict:
     """Map Glassdoor output fields to the shared job schema."""
-    salary = raw.get("job_salary") or {}
+    # Salary from pay object
+    pay = raw.get("pay") or {}
     salary_text = ""
-    if salary:
-        lo = salary.get("min")
-        hi = salary.get("max")
-        currency = salary.get("currency_symbol", "$")
-        period = salary.get("pay_period", "")
+    if pay:
+        lo = pay.get("min")
+        hi = pay.get("max")
+        currency = pay.get("currency") or "USD"
+        period = (pay.get("period") or "").capitalize()
+        symbol = "$" if currency == "USD" else currency + " "
         if lo and hi:
-            salary_text = f"{currency}{lo:,}–{currency}{hi:,} {period}".strip()
+            salary_text = f"{symbol}{lo:,}–{symbol}{hi:,} {period}".strip()
         elif lo:
-            salary_text = f"{currency}{lo:,}+ {period}".strip()
+            salary_text = f"{symbol}{lo:,}+ {period}".strip()
 
-    location = raw.get("job_location") or {}
-    location_str = location.get("unknown") or location.get("city") or ""
+    # Location
+    location = raw.get("location") or {}
+    location_str = location.get("name", "")
+
+    # Company from employer object
+    employer = raw.get("employer") or {}
+
+    # URL — prefer seoUrl for human-readable links
+    job_url = raw.get("seoUrl") or raw.get("url", "")
+
+    # Posted date — convert ageInDays to approximate ISO date
+    posted_at = None
+    age = raw.get("ageInDays")
+    if age is not None:
+        posted_at = (datetime.now(timezone.utc) - timedelta(days=age)).isoformat()
 
     return {
-        "id": raw.get("job_url", "")[:200],
-        "title": raw.get("job_title", ""),
-        "company": raw.get("company_name", ""),
-        "url": raw.get("job_url") or raw.get("job_apply_url", ""),
+        "id": str(raw.get("id", "")) or job_url[:200],
+        "title": raw.get("title", ""),
+        "company": employer.get("name", ""),
+        "url": job_url,
         "salary": salary_text,
-        "description": raw.get("job_description", ""),
+        "description": (raw.get("description") or "")[:5000],
         "location": location_str,
-        "postedAt": raw.get("job_posted_date"),
-        "is_remote": raw.get("job_is_remote", False),
+        "postedAt": posted_at,
+        "is_remote": False,
         "source": "glassdoor",
     }
 
 
-def run_search(keywords: list[str]) -> list[dict]:
-    """Full flow: trigger → wait → fetch → normalise. Returns list of job dicts."""
-    run_id = run_actor(keywords)
+def _search_one(keyword: str) -> list[dict]:
+    """Run a single keyword search end-to-end."""
+    run_id = run_actor(keyword)
     dataset_id = wait_for_run(run_id)
-    raw_items = fetch_dataset(dataset_id)
-    return [normalise_glassdoor(item) for item in raw_items]
+    return fetch_dataset(dataset_id)
+
+
+def run_search(keywords: list[str]) -> list[dict]:
+    """Run one Glassdoor search per keyword (sequentially), deduplicate results."""
+    all_jobs: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for kw in keywords:
+        try:
+            raw_items = _search_one(kw)
+            added = 0
+            for item in raw_items:
+                job = normalise_glassdoor(item)
+                if job["id"] and job["id"] not in seen_ids:
+                    seen_ids.add(job["id"])
+                    all_jobs.append(job)
+                    added += 1
+            logger.info(f"Glassdoor '{kw}': {len(raw_items)} raw, {added} new")
+        except Exception as e:
+            logger.error(f"Glassdoor search failed for '{kw}': {e}")
+
+    return all_jobs
 
 
 if __name__ == "__main__":
-    jobs = run_search()
+    jobs = run_search(["automation engineer", "AI workflow"])
     print(json.dumps(jobs, ensure_ascii=False, indent=2))
     logger.info(f"Done. {len(jobs)} Glassdoor jobs fetched.")
