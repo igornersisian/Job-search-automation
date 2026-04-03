@@ -132,7 +132,7 @@ def save_profile(raw_text: str, parsed: dict) -> None:
     """
     existing = get_profile()
     if existing:
-        for key in ("search_keywords", "custom_red_flags", "score_threshold"):
+        for key in ("search_keywords", "custom_red_flags", "score_threshold", "excluded_title_keywords"):
             if key in existing:
                 parsed[key] = existing[key]
     get_supabase().table("profile").upsert({
@@ -200,6 +200,27 @@ def save_custom_red_flags(flags: list[str]) -> None:
         logger.error("No profile found — upload resume first")
         return
     profile["custom_red_flags"] = flags
+    get_supabase().table("profile").update({
+        "parsed": profile,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", 1).execute()
+
+
+def get_excluded_title_keywords() -> list[str]:
+    """Return excluded title keywords from profile, or empty list if not set."""
+    profile = get_profile()
+    if profile:
+        return profile.get("excluded_title_keywords") or []
+    return []
+
+
+def save_excluded_title_keywords(keywords: list[str]) -> None:
+    """Save excluded title keywords into the profile's parsed JSONB."""
+    profile = get_profile()
+    if not profile:
+        logger.error("No profile found — upload resume first")
+        return
+    profile["excluded_title_keywords"] = keywords
     get_supabase().table("profile").update({
         "parsed": profile,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -343,6 +364,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/keywords — set search keywords (comma-separated)\n"
         "/threshold — set minimum score % to send (default 70)\n"
         "/redflags — set dealbreakers (e.g. requires US work permit)\n"
+        "/excluded — set title keywords to skip (e.g. intern, trainee)\n"
         "/stats — all-time job search statistics\n"
         "/fetch\\_jobs — manually run the job search pipeline now\n"
         "/job <url> — analyze a specific job URL and set it as active context\n\n"
@@ -447,6 +469,45 @@ async def cmd_redflags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     save_custom_red_flags(flags)
     lines = "\n".join(f"• {f}" for f in flags)
     await update.message.reply_text(f"Dealbreakers saved ({len(flags)}):\n{lines}")
+
+
+async def cmd_excluded(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set, show, or clear excluded title keywords (jobs with these words in title are skipped)."""
+    if not context.args:
+        excluded = get_excluded_title_keywords()
+        if excluded:
+            lines = "\n".join(f"• {e}" for e in excluded)
+            await update.message.reply_text(
+                f"*Excluded title keywords:*\n{lines}\n\n"
+                "To replace: /excluded intern, trainee, apprentice\n"
+                "To clear: /excluded clear",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "No excluded title keywords set (all jobs pass through).\n"
+                "To add: /excluded intern, trainee, apprentice"
+            )
+        return
+
+    raw_text = " ".join(context.args)
+
+    if raw_text.strip().lower() == "clear":
+        save_excluded_title_keywords([])
+        await update.message.reply_text("Excluded title keywords cleared. All jobs will pass through.")
+        return
+
+    keywords = [kw.strip().lower() for kw in raw_text.split(",") if kw.strip()]
+    if not keywords:
+        await update.message.reply_text(
+            "Send keywords separated by commas:\n"
+            "/excluded intern, trainee, apprentice"
+        )
+        return
+
+    save_excluded_title_keywords(keywords)
+    lines = "\n".join(f"• {kw}" for kw in keywords)
+    await update.message.reply_text(f"Excluded title keywords saved ({len(keywords)}):\n{lines}")
 
 
 async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -742,6 +803,7 @@ def main() -> None:
     app.add_handler(CommandHandler("keywords", cmd_keywords))
     app.add_handler(CommandHandler("threshold", cmd_threshold))
     app.add_handler(CommandHandler("redflags", cmd_redflags))
+    app.add_handler(CommandHandler("excluded", cmd_excluded))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("fetch_jobs", cmd_fetch_jobs))
     app.add_handler(CommandHandler("job", cmd_job))

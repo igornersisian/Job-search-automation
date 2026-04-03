@@ -103,7 +103,7 @@ def send_job_card(job: dict) -> bool:
 def send_daily_summary(
     sent: int,
     skipped_score: int,
-    skipped_junior: int,
+    skipped_excluded: int,
     skipped_dupe: int,
     threshold: int = 70,
     dupes_crossrun: int = 0,
@@ -126,7 +126,7 @@ def send_daily_summary(
         f"*Daily job search complete*\n"
         f"✅ Sent to you: {sent}\n"
         f"🔕 Low score (<{threshold}%): {skipped_score}\n"
-        f"🚫 Junior/intern filtered: {skipped_junior}\n"
+        f"🚫 Excluded by title: {skipped_excluded}\n"
         f"♻️ Duplicates skipped: {skipped_dupe}{dupe_detail}"
     )
     try:

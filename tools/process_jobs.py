@@ -33,7 +33,7 @@ from run_indeed_search import run_search as run_indeed_search
 from run_wellfound_search import run_search as run_wellfound_search
 from run_remoteboards_search import run_search as run_remoteboards_search
 from run_ats_search import run_search as run_ats_search
-from score_job import score_job, quick_score, is_junior_or_intern
+from score_job import score_job, quick_score, is_excluded_by_title
 from notify_telegram import send_job_card, send_daily_summary, send_message
 
 load_dotenv()
@@ -310,6 +310,12 @@ def run_pipeline() -> None:
         return
     logger.info(f"Search keywords ({len(keywords)}): {keywords}")
 
+    excluded_title_kw = profile.get("excluded_title_keywords") or []
+    if excluded_title_kw:
+        logger.info(f"Excluded title keywords ({len(excluded_title_kw)}): {excluded_title_kw}")
+    else:
+        logger.info("No excluded title keywords set — title filter disabled")
+
     # ── Phase 0: Fetch jobs from all sources in parallel ─────────────
     raw_jobs = _fetch_all_sources(keywords, profile)
 
@@ -319,9 +325,9 @@ def run_pipeline() -> None:
 
     logger.info(f"Total raw jobs: {len(raw_jobs)}")
 
-    # ── Phase 1: Dedup + junior filter (fast, sequential, no API calls) ──
+    # ── Phase 1: Dedup + title exclusion filter (fast, sequential, no API calls) ──
     candidates: list[dict] = []
-    skipped_junior = 0
+    skipped_excluded = 0
     dupes_crossrun = 0   # already in Supabase from previous runs
     dupes_local = 0      # same ID appeared multiple times this run
     dupes_fuzzy = 0      # same title+company with similar description
@@ -382,11 +388,11 @@ def run_pipeline() -> None:
         # Not a duplicate — register in fuzzy group
         fuzzy_groups.setdefault(dedup_key, []).append(job)
 
-        # Junior/intern filter
-        if is_junior_or_intern(job):
-            logger.info(f"[JUNIOR] {job['title']} @ {job['company']}")
-            save_job(job, "filtered_junior")
-            skipped_junior += 1
+        # Title exclusion filter
+        if is_excluded_by_title(job, excluded_title_kw):
+            logger.info(f"[EXCLUDED] {job['title']} @ {job['company']}")
+            save_job(job, "filtered_excluded")
+            skipped_excluded += 1
             continue
 
         candidates.append(job)
@@ -395,7 +401,7 @@ def run_pipeline() -> None:
     logger.info(
         f"Phase 1 done — {len(candidates)} candidates, "
         f"{skipped_dupe} dupes (prev runs: {dupes_crossrun}, same run: {dupes_local}, fuzzy: {dupes_fuzzy}), "
-        f"{skipped_junior} junior filtered"
+        f"{skipped_excluded} excluded by title"
     )
 
     # ── Phase 2: Score + enrich + send IN PARALLEL ───────────────────
@@ -428,14 +434,14 @@ def run_pipeline() -> None:
     logger.info(
         f"Pipeline done — sent: {sent}, "
         f"low score: {skipped_score}, "
-        f"junior: {skipped_junior}, "
+        f"excluded: {skipped_excluded}, "
         f"dupes: {skipped_dupe}"
     )
 
     send_daily_summary(
         sent=sent,
         skipped_score=skipped_score,
-        skipped_junior=skipped_junior,
+        skipped_excluded=skipped_excluded,
         skipped_dupe=skipped_dupe,
         dupes_crossrun=dupes_crossrun,
         dupes_local=dupes_local,

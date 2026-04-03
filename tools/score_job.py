@@ -79,21 +79,12 @@ def _chat_completion(messages: list, max_retries: int = 3, **kwargs):
 
     raise last_error
 
-# Only filter actual internships/trainee positions — not entry-level or junior
-INTERN_KEYWORDS = [
-    "intern",
-    "internship",
-    "trainee",
-    "graduate program",
-    "apprentice",
-    "apprenticeship",
-]
-
-
-def is_junior_or_intern(job: dict) -> bool:
-    """Return True if job title indicates an internship/trainee position."""
+def is_excluded_by_title(job: dict, excluded_keywords: list[str]) -> bool:
+    """Return True if job title contains any of the user-defined excluded keywords."""
+    if not excluded_keywords:
+        return False
     title = job.get("title", "").lower()
-    return any(kw in title for kw in INTERN_KEYWORDS)
+    return any(kw in title for kw in excluded_keywords)
 
 
 def quick_score(job: dict, profile: dict) -> int:
