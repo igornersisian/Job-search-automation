@@ -763,7 +763,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"\nACTIVE JOB CONTEXT:\n"
             f"Title: {active_job.get('title')} @ {active_job.get('company')}\n"
             f"Score: {active_job.get('score')}/100\n"
-            f"Description excerpt: {active_job.get('description', '')[:2000]}"
+            f"Description: {active_job.get('description', '')}"
         )
 
     system_prompt = "\n".join(system_parts)
