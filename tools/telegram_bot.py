@@ -12,6 +12,7 @@ Capabilities:
 import os
 import sys
 import io
+import re
 import json
 import logging
 import asyncio
@@ -75,6 +76,44 @@ active_jobs: dict[int, dict] = {}
 # ---------------------------------------------------------------------------
 # Supabase helpers
 # ---------------------------------------------------------------------------
+
+def get_job_by_url(url: str) -> dict | None:
+    """Look up a job in Supabase by its URL."""
+    try:
+        result = get_supabase().table("jobs").select("*").eq("url", url).limit(1).execute()
+        if result.data:
+            row = result.data[0]
+            return {
+                "id": row.get("id"),
+                "title": row.get("title", ""),
+                "company": row.get("company", ""),
+                "url": row.get("url", ""),
+                "salary": row.get("salary_text", ""),
+                "description": row.get("description", ""),
+                "score": row.get("score"),
+                "match_summary": row.get("match_summary", ""),
+                "red_flags": json.loads(row.get("red_flags") or "[]"),
+                "source": row.get("source", ""),
+            }
+    except Exception as e:
+        logger.error(f"get_job_by_url error: {e}")
+    return None
+
+
+def _extract_job_url_from_message(text: str) -> str | None:
+    """Extract job URL from a job card message (the [Open job](url) link)."""
+    if not text:
+        return None
+    # Match Markdown link: [Open job](url)
+    m = re.search(r'\[Open job\]\(([^)]+)\)', text)
+    if m:
+        return m.group(1)
+    # Fallback: look for common job board URLs in plain text
+    m = re.search(r'(https?://(?:www\.)?(?:linkedin\.com|glassdoor\.com|indeed\.com|wellfound\.com)\S+)', text)
+    if m:
+        return m.group(1)
+    return None
+
 
 def get_profile() -> dict | None:
     """Return the latest parsed resume profile from Supabase."""
@@ -612,6 +651,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_text = update.message.text
 
     profile = get_profile()
+
+    # If user replies to a job card message, load that job as active context
+    reply = update.message.reply_to_message
+    if reply and reply.text:
+        job_url = _extract_job_url_from_message(reply.text)
+        if job_url:
+            job_from_db = get_job_by_url(job_url)
+            if job_from_db:
+                active_jobs[chat_id] = job_from_db
+                logger.info(f"Loaded job from reply: {job_from_db['title']} @ {job_from_db['company']}")
+
     active_job = active_jobs.get(chat_id)
 
     system_parts = [
@@ -700,7 +750,7 @@ def main() -> None:
     app.job_queue.run_daily(
         scheduled_pipeline,
         time=dt_time(hour=9, minute=0, tzinfo=timezone.utc),
-        days=(0, 1, 2, 3, 4),  # Mon-Fri
+        days=(0, 1, 2, 3, 4, 5, 6),  # Every day
         name="daily_job_search",
     )
     logger.info("Scheduled daily pipeline for weekdays 09:00 UTC")

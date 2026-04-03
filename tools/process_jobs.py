@@ -41,6 +41,94 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Smart deduplication helpers
+# ---------------------------------------------------------------------------
+
+# Title abbreviation map for normalisation
+_TITLE_SYNONYMS = {
+    "sr": "senior", "sr.": "senior",
+    "jr": "junior", "jr.": "junior",
+    "eng": "engineer", "eng.": "engineer",
+    "dev": "developer", "dev.": "developer",
+    "mgr": "manager", "mgr.": "manager",
+    "dir": "director", "dir.": "director",
+    "vp": "vice president",
+    "assoc": "associate", "assoc.": "associate",
+    "asst": "assistant", "asst.": "assistant",
+    "admin": "administrator",
+    "ops": "operations",
+    "swe": "software engineer",
+    "sde": "software development engineer",
+    "ml": "machine learning",
+    "ai": "artificial intelligence",
+    "qa": "quality assurance",
+    "ui": "user interface",
+    "ux": "user experience",
+    "fe": "frontend",
+    "be": "backend",
+}
+
+# Company suffixes to strip
+_COMPANY_SUFFIXES = [
+    ", inc.", ", inc", " inc.", " inc",
+    ", llc", " llc",
+    ", ltd.", ", ltd", " ltd.", " ltd",
+    ", corp.", ", corp", " corp.", " corp",
+    ", co.", ", co", " co.",
+    ", gmbh", " gmbh",
+    ", s.a.", " s.a.",
+    ", plc", " plc",
+    ", ag", " ag",
+    ", pty", " pty",
+]
+
+
+def _normalise_title(title: str) -> str:
+    """Normalise a job title for dedup comparison."""
+    t = title.lower().strip()
+    # Remove common punctuation noise
+    t = t.replace("-", " ").replace("–", " ").replace("/", " ")
+    # Replace abbreviations with full forms
+    words = t.split()
+    words = [_TITLE_SYNONYMS.get(w, w) for w in words]
+    # Remove filler words
+    fillers = {"a", "an", "the", "and", "&", "of", "for", "with", "in", "at", "to", "-", "–", "—"}
+    words = [w for w in words if w not in fillers]
+    return " ".join(words)
+
+
+def _normalise_company(company: str) -> str:
+    """Normalise a company name for dedup comparison."""
+    c = company.lower().strip()
+    for suffix in _COMPANY_SUFFIXES:
+        if c.endswith(suffix):
+            c = c[: -len(suffix)].strip()
+            break
+    # Remove trailing punctuation
+    c = c.rstrip(".,")
+    return c
+
+
+def _description_similarity(desc_a: str, desc_b: str) -> float:
+    """Compute word-level Jaccard similarity between two descriptions.
+    Returns float 0.0-1.0.
+    """
+    if not desc_a or not desc_b:
+        return 0.0
+    # Use a set of meaningful words (>= 4 chars to skip noise)
+    words_a = {w for w in desc_a.lower().split() if len(w) >= 4}
+    words_b = {w for w in desc_b.lower().split() if len(w) >= 4}
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    union = words_a | words_b
+    return len(intersection) / len(union)
+
+
+DEDUP_SIMILARITY_THRESHOLD = 0.45
+
+
 DEFAULT_SCORE_THRESHOLD = 70
 
 DEFAULT_KEYWORDS = [
@@ -229,7 +317,9 @@ def run_pipeline() -> None:
     skipped_junior = 0
 
     processed_ids: set[str] = set()
-    processed_titles: set[str] = set()
+    # Smart dedup: group jobs by normalised title+company, then check description similarity
+    # Key: "normalised_title|normalised_company" → list of jobs with that key
+    fuzzy_groups: dict[str, list[dict]] = {}
 
     for raw in raw_jobs:
         job = normalise_job(raw)
@@ -246,15 +336,36 @@ def run_pipeline() -> None:
         if job["id"] in processed_ids:
             skipped_dupe += 1
             continue
+        processed_ids.add(job["id"])
 
-        # Dedup: local by title+company (cross-source — same job on LinkedIn + Indeed)
-        dedup_key = f"{job['title'].lower().strip()}|{job['company'].lower().strip()}"
-        if dedup_key in processed_titles:
+        # Smart fuzzy dedup: normalise title + company, then compare descriptions
+        norm_title = _normalise_title(job["title"])
+        norm_company = _normalise_company(job["company"])
+        dedup_key = f"{norm_title}|{norm_company}"
+
+        is_duplicate = False
+        if dedup_key in fuzzy_groups:
+            # Same normalised title+company exists — check if descriptions are similar
+            for existing_job in fuzzy_groups[dedup_key]:
+                sim = _description_similarity(
+                    job.get("description", ""),
+                    existing_job.get("description", ""),
+                )
+                if sim >= DEDUP_SIMILARITY_THRESHOLD:
+                    logger.info(
+                        f"[DEDUP] '{job['title']}' @ {job['company']} ({job.get('source')}) "
+                        f"≈ '{existing_job['title']}' @ {existing_job['company']} ({existing_job.get('source')}) "
+                        f"[similarity={sim:.0%}]"
+                    )
+                    is_duplicate = True
+                    break
+
+        if is_duplicate:
             skipped_dupe += 1
             continue
 
-        processed_ids.add(job["id"])
-        processed_titles.add(dedup_key)
+        # Not a duplicate — register in fuzzy group
+        fuzzy_groups.setdefault(dedup_key, []).append(job)
 
         # Junior/intern filter
         if is_junior_or_intern(job):
