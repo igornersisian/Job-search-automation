@@ -111,41 +111,44 @@ def quick_score(job: dict, profile: dict) -> int:
 
     # Custom dealbreakers from profile
     dealbreakers = profile.get("custom_red_flags") or []
-    dealbreakers_text = ""
+
+    # Build system prompt — dealbreakers go here for maximum weight
+    system_content = (
+        "Rate how well this candidate REALISTICALLY fits the job. "
+        "Use ONLY facts explicitly stated in the profile — do not infer, assume, or guess.\n\n"
+    )
+
     if dealbreakers:
         items = "\n".join(f"- {d}" for d in dealbreakers)
-        dealbreakers_text = (
-            f"\n\nCANDIDATE DEALBREAKERS (if ANY of these apply, score below 30):\n{items}"
+        system_content += (
+            "DEALBREAKERS — HIGHEST PRIORITY:\n"
+            "If ANY of the following apply to this job, the score MUST be 25 or below. "
+            "No exceptions. Check these FIRST before evaluating anything else:\n"
+            f"{items}\n\n"
         )
+
+    system_content += (
+        "SCORING RULES:\n"
+        "- If the job requires N+ years of experience and the candidate has significantly less "
+        "(e.g. job asks 5+ years, candidate has <2), cap score at 40\n"
+        "- If the job requires specific programming languages or frameworks the candidate "
+        "doesn't demonstrate, deduct 15-20 points per critical missing skill\n"
+        "- If the job is senior/lead/staff level and candidate profile shows junior-level "
+        "experience, cap score at 45\n"
+        "- Score 70+ ONLY if the candidate could realistically compete for this role\n"
+        "- Score 90+ ONLY if the candidate meets virtually ALL stated requirements\n"
+        "- No-code/low-code experience does NOT count as software engineering experience "
+        "unless the job specifically asks for no-code skills\n"
+        "- When requirements are ambiguous, lean slightly lower rather than higher\n\n"
+        'Return JSON: {"score": <int 0-100>}'
+    )
 
     response = _chat_completion(
         model="gpt-4.1-mini",
         response_format={"type": "json_object"},
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Rate how well this candidate REALISTICALLY fits the job. "
-                    "Use ONLY facts explicitly stated in the profile — do not infer, assume, or guess.\n\n"
-                    "SCORING RULES:\n"
-                    "- If the job requires N+ years of experience and the candidate has significantly less "
-                    "(e.g. job asks 5+ years, candidate has <2), cap score at 40\n"
-                    "- If the job requires specific programming languages or frameworks the candidate "
-                    "doesn't demonstrate, deduct 15-20 points per critical missing skill\n"
-                    "- If the job is senior/lead/staff level and candidate profile shows junior-level "
-                    "experience, cap score at 45\n"
-                    "- Score 70+ ONLY if the candidate could realistically compete for this role\n"
-                    "- Score 90+ ONLY if the candidate meets virtually ALL stated requirements\n"
-                    "- No-code/low-code experience does NOT count as software engineering experience "
-                    "unless the job specifically asks for no-code skills\n"
-                    "- When requirements are ambiguous, lean slightly lower rather than higher\n\n"
-                    'Return JSON: {"score": <int 0-100>}'
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"PROFILE:\n{profile_text}\n\nJOB:\n{job_text}{dealbreakers_text}",
-            },
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": f"PROFILE:\n{profile_text}\n\nJOB:\n{job_text}"},
         ],
     )
     result = json.loads(response.choices[0].message.content)
@@ -169,11 +172,11 @@ def score_job(job: dict, profile: dict) -> dict:
 
     # Custom dealbreakers from profile
     dealbreakers = profile.get("custom_red_flags") or []
-    dealbreakers_text = ""
+    dealbreakers_section = ""
     if dealbreakers:
         items = "\n".join(f"- {d}" for d in dealbreakers)
-        dealbreakers_text = (
-            f"\n\nCANDIDATE DEALBREAKERS (flag these in red_flags if they apply):\n{items}"
+        dealbreakers_section = (
+            f"\n\nYOUR DEALBREAKERS (flag in red_flags if any apply):\n{items}"
         )
 
     response = _chat_completion(
@@ -183,17 +186,21 @@ def score_job(job: dict, profile: dict) -> dict:
             {
                 "role": "system",
                 "content": (
-                    "You are a career advisor evaluating job fit for a candidate.\n\n"
+                    "You are writing a short job evaluation directly TO the candidate (use 'you/your', "
+                    "never third person like 'the candidate' or 'Igor').\n\n"
                     "CRITICAL RULES:\n"
                     "- Use ONLY facts explicitly stated in the candidate profile. "
-                    "Do NOT infer, assume, or invent any details about the candidate's experience, "
-                    "years of work, skills, or projects that are not written in the profile.\n"
-                    "- If something is not mentioned in the profile, treat it as absent — "
-                    "do not guess or extrapolate.\n"
-                    "- When citing candidate experience, quote the actual profile data.\n\n"
+                    "Do NOT infer, assume, or invent any details.\n"
+                    "- If something is not mentioned in the profile, treat it as absent.\n"
+                    "- Address the candidate directly: 'This role fits you because...' or "
+                    "'You lack the required...'\n\n"
                     "Return a JSON object with:\n"
-                    "- match_summary: string (1-2 sentences on why this is or isn't a good fit)\n"
-                    "- red_flags: list of strings (concerns, missing requirements, or mismatches)\n\n"
+                    "- match_summary: string (1-2 sentences explaining why this job does or doesn't "
+                    "fit YOU, focused on the job's requirements vs your profile)\n"
+                    "- red_flags: list of strings — ONLY genuine concerns, mismatches, or dealbreakers. "
+                    "Include as many or as few as actually exist. Do NOT pad to a fixed number. "
+                    "If there are zero real concerns, return an empty list. "
+                    "Do NOT duplicate the same concern in different words.\n\n"
                     "Return only valid JSON."
                 ),
             },
@@ -201,7 +208,7 @@ def score_job(job: dict, profile: dict) -> dict:
                 "role": "user",
                 "content": (
                     f"CANDIDATE PROFILE:\n{profile_text}\n\n"
-                    f"JOB POSTING:\n{job_text}{dealbreakers_text}"
+                    f"JOB POSTING:\n{job_text}{dealbreakers_section}"
                 ),
             },
         ],

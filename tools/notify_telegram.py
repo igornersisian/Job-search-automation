@@ -76,7 +76,7 @@ def format_job_card(job: dict) -> str:
     if red_flags:
         lines.append("")
         lines.append("*Red flags:*")
-        for flag in red_flags[:3]:
+        for flag in red_flags:
             lines.append(f"⚠️ {_esc_md(flag)}")
 
     if url:
