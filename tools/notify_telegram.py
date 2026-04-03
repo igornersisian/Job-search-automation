@@ -100,14 +100,34 @@ def send_job_card(job: dict) -> bool:
         return False
 
 
-def send_daily_summary(sent: int, skipped_score: int, skipped_junior: int, skipped_dupe: int, threshold: int = 70) -> None:
+def send_daily_summary(
+    sent: int,
+    skipped_score: int,
+    skipped_junior: int,
+    skipped_dupe: int,
+    threshold: int = 70,
+    dupes_crossrun: int = 0,
+    dupes_local: int = 0,
+    dupes_fuzzy: int = 0,
+) -> None:
     """Send a brief daily pipeline summary."""
+    dupe_detail = ""
+    if skipped_dupe:
+        parts = []
+        if dupes_crossrun:
+            parts.append(f"prev runs: {dupes_crossrun}")
+        if dupes_local:
+            parts.append(f"same run: {dupes_local}")
+        if dupes_fuzzy:
+            parts.append(f"fuzzy: {dupes_fuzzy}")
+        if parts:
+            dupe_detail = f" ({', '.join(parts)})"
     text = (
         f"*Daily job search complete*\n"
         f"✅ Sent to you: {sent}\n"
         f"🔕 Low score (<{threshold}%): {skipped_score}\n"
         f"🚫 Junior/intern filtered: {skipped_junior}\n"
-        f"♻️ Duplicates skipped: {skipped_dupe}"
+        f"♻️ Duplicates skipped: {skipped_dupe}{dupe_detail}"
     )
     try:
         send_message(text)

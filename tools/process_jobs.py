@@ -271,7 +271,7 @@ def _process_single_job(job: dict, profile: dict, threshold: int) -> tuple[dict,
         job = score_job(job, profile)
     except Exception as e:
         logger.error(f"Enrichment failed for {job['title']}: {e}")
-        job["match_summary"] = ""
+        job["match_summary"] = "(enrichment failed — see job listing)"
         job["red_flags"] = []
 
     # Send to Telegram
@@ -313,8 +313,10 @@ def run_pipeline() -> None:
 
     # ── Phase 1: Dedup + junior filter (fast, sequential, no API calls) ──
     candidates: list[dict] = []
-    skipped_dupe = 0
     skipped_junior = 0
+    dupes_crossrun = 0   # already in Supabase from previous runs
+    dupes_local = 0      # same ID appeared multiple times this run
+    dupes_fuzzy = 0      # same title+company with similar description
 
     processed_ids: set[str] = set()
     # Smart dedup: group jobs by normalised title+company, then check description similarity
@@ -329,12 +331,12 @@ def run_pipeline() -> None:
 
         # Dedup: Supabase (cross-run, catches jobs from previous days)
         if is_already_seen(job["id"]):
-            skipped_dupe += 1
+            dupes_crossrun += 1
             continue
 
         # Dedup: local by ID (within this run — same job from same source)
         if job["id"] in processed_ids:
-            skipped_dupe += 1
+            dupes_local += 1
             continue
         processed_ids.add(job["id"])
 
@@ -361,7 +363,7 @@ def run_pipeline() -> None:
                     break
 
         if is_duplicate:
-            skipped_dupe += 1
+            dupes_fuzzy += 1
             continue
 
         # Not a duplicate — register in fuzzy group
@@ -376,9 +378,11 @@ def run_pipeline() -> None:
 
         candidates.append(job)
 
+    skipped_dupe = dupes_crossrun + dupes_local + dupes_fuzzy
     logger.info(
         f"Phase 1 done — {len(candidates)} candidates, "
-        f"{skipped_dupe} dupes, {skipped_junior} junior filtered"
+        f"{skipped_dupe} dupes (prev runs: {dupes_crossrun}, same run: {dupes_local}, fuzzy: {dupes_fuzzy}), "
+        f"{skipped_junior} junior filtered"
     )
 
     # ── Phase 2: Score + enrich + send IN PARALLEL ───────────────────
@@ -386,7 +390,7 @@ def run_pipeline() -> None:
     skipped_score = 0
     errors = 0
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {
             executor.submit(_process_single_job, job, profile, threshold): job
             for job in candidates
@@ -420,6 +424,9 @@ def run_pipeline() -> None:
         skipped_score=skipped_score,
         skipped_junior=skipped_junior,
         skipped_dupe=skipped_dupe,
+        dupes_crossrun=dupes_crossrun,
+        dupes_local=dupes_local,
+        dupes_fuzzy=dupes_fuzzy,
         threshold=threshold,
     )
 

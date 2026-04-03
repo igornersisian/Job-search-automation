@@ -3,6 +3,10 @@
 
 OPENAI_API_KEY=
 
+# OpenRouter — fallback when OpenAI rate limits hit
+# Get from https://openrouter.ai/settings/keys
+OPENROUTER_API_KEY=
+
 # Apify — get from https://console.apify.com/account/integrations
 APIFY_API_TOKEN=
 

@@ -15,6 +15,7 @@ Usage (standalone):
 import os
 import sys
 import json
+import time
 import logging
 
 from openai import OpenAI
@@ -29,6 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _openai_client: OpenAI | None = None
+_openrouter_client: OpenAI | None = None
 
 
 def get_openai() -> OpenAI:
@@ -36,6 +38,46 @@ def get_openai() -> OpenAI:
     if _openai_client is None:
         _openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     return _openai_client
+
+
+def _get_openrouter() -> OpenAI | None:
+    """Return OpenRouter client if API key is configured, else None."""
+    global _openrouter_client
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        return None
+    if _openrouter_client is None:
+        _openrouter_client = OpenAI(
+            api_key=key,
+            base_url="https://openrouter.ai/api/v1",
+        )
+    return _openrouter_client
+
+
+def _chat_completion(messages: list, max_retries: int = 3, **kwargs):
+    """OpenAI call with retry on 429 + OpenRouter fallback."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return get_openai().chat.completions.create(messages=messages, **kwargs)
+        except Exception as e:
+            if "429" in str(e):
+                last_error = e
+                wait = min(2 ** attempt, 8)
+                logger.warning(f"Rate limited, retry in {wait}s ({attempt+1}/{max_retries})")
+                time.sleep(wait)
+            else:
+                raise
+
+    # Retries exhausted — try OpenRouter
+    fallback = _get_openrouter()
+    if fallback:
+        model = kwargs.pop("model", "gpt-4.1-mini")
+        kwargs["model"] = f"openai/{model}"
+        logger.info(f"Falling back to OpenRouter ({kwargs['model']})")
+        return fallback.chat.completions.create(messages=messages, **kwargs)
+
+    raise last_error
 
 # Only filter actual internships/trainee positions — not entry-level or junior
 INTERN_KEYWORDS = [
@@ -76,17 +118,28 @@ def quick_score(job: dict, profile: dict) -> int:
             f"\n\nCANDIDATE DEALBREAKERS (if ANY of these apply, score below 30):\n{items}"
         )
 
-    response = get_openai().chat.completions.create(
+    response = _chat_completion(
         model="gpt-4.1-mini",
         response_format={"type": "json_object"},
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "Rate how well this candidate fits the job. "
-                    "Use ONLY facts from the profile, do not infer or assume.\n"
-                    'Return JSON: {"score": <int 0-100>}\n'
-                    "90-100: excellent match, 70-89: good, 50-69: partial, 0-49: poor."
+                    "Rate how well this candidate REALISTICALLY fits the job. "
+                    "Use ONLY facts explicitly stated in the profile — do not infer, assume, or guess.\n\n"
+                    "SCORING RULES:\n"
+                    "- If the job requires N+ years of experience and the candidate has significantly less "
+                    "(e.g. job asks 5+ years, candidate has <2), cap score at 40\n"
+                    "- If the job requires specific programming languages or frameworks the candidate "
+                    "doesn't demonstrate, deduct 15-20 points per critical missing skill\n"
+                    "- If the job is senior/lead/staff level and candidate profile shows junior-level "
+                    "experience, cap score at 45\n"
+                    "- Score 70+ ONLY if the candidate could realistically compete for this role\n"
+                    "- Score 90+ ONLY if the candidate meets virtually ALL stated requirements\n"
+                    "- No-code/low-code experience does NOT count as software engineering experience "
+                    "unless the job specifically asks for no-code skills\n"
+                    "- When requirements are ambiguous, lean slightly lower rather than higher\n\n"
+                    'Return JSON: {"score": <int 0-100>}'
                 ),
             },
             {
@@ -123,7 +176,7 @@ def score_job(job: dict, profile: dict) -> dict:
             f"\n\nCANDIDATE DEALBREAKERS (flag these in red_flags if they apply):\n{items}"
         )
 
-    response = get_openai().chat.completions.create(
+    response = _chat_completion(
         model="gpt-4.1-mini",
         response_format={"type": "json_object"},
         messages=[

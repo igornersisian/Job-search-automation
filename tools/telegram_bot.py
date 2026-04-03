@@ -128,11 +128,13 @@ def get_profile() -> dict | None:
 
 def save_profile(raw_text: str, parsed: dict) -> None:
     """Upsert resume profile in Supabase (single row, id=1).
-    Preserves search_keywords if they already exist in the profile.
+    Preserves user-configured settings from the existing profile.
     """
     existing = get_profile()
-    if existing and "search_keywords" in existing:
-        parsed["search_keywords"] = existing["search_keywords"]
+    if existing:
+        for key in ("search_keywords", "custom_red_flags", "score_threshold"):
+            if key in existing:
+                parsed[key] = existing[key]
     get_supabase().table("profile").upsert({
         "id": 1,
         "raw_text": raw_text,
