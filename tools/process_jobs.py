@@ -174,7 +174,7 @@ def fetch_existing_ids(job_ids: list[str]) -> set[str]:
     Queries in chunks to avoid URL length limits.
     """
     existing: set[str] = set()
-    chunk_size = 200
+    chunk_size = 100
     for i in range(0, len(job_ids), chunk_size):
         chunk = job_ids[i : i + chunk_size]
         result = get_supabase().table("jobs").select("id").in_("id", chunk).execute()
