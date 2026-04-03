@@ -181,7 +181,7 @@ def save_job(job: dict, status: str) -> None:
         "url": job.get("url") or job.get("jobUrl", ""),
         "salary_text": job.get("salary") or job.get("salaryText", ""),
         "is_remote": True,
-        "description": job.get("description", "")[:5000],
+        "description": job.get("description", "")[:10000],
         "posted_at": job.get("postedAt") or job.get("publishedAt"),
         "score": job.get("score"),
         "match_summary": job.get("match_summary", ""),
