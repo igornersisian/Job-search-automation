@@ -456,15 +456,15 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Percentage
         pct = (sent / total * 100) if total else 0
 
-        # Average per day: count distinct dates among sent jobs
-        sent_dates = set()
+        # Count distinct days across ALL jobs
+        all_dates = set()
         for r in rows:
-            if r["status"] == "sent" and r.get("created_at"):
-                day = r["created_at"][:10]  # "2026-04-03"
-                sent_dates.add(day)
+            if r.get("created_at"):
+                all_dates.add(r["created_at"][:10])
 
-        days_active = len(sent_dates) or 1
-        avg_per_day = sent / days_active
+        days_active = len(all_dates) or 1
+        avg_processed = total / days_active
+        avg_sent = sent / days_active
 
         await update.message.reply_text(
             f"*All-time statistics*\n\n"
@@ -474,8 +474,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"🚫 Junior/intern: {junior}\n"
             f"❌ Errors: {errors}\n\n"
             f"📈 Match rate: {pct:.1f}%\n"
-            f"📅 Days with results: {days_active}\n"
-            f"📬 Avg per day: {avg_per_day:.1f}",
+            f"📅 Days active: {days_active}\n"
+            f"📬 Avg processed/day: {avg_processed:.1f}\n"
+            f"✅ Avg sent/day: {avg_sent:.1f}",
             parse_mode="Markdown",
         )
     except Exception as e:
