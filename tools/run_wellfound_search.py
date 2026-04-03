@@ -13,6 +13,7 @@ Usage:
 
 import os
 import json
+import re
 import time
 import logging
 from datetime import datetime, timezone
@@ -35,48 +36,45 @@ def _get_token() -> str:
     return os.environ["APIFY_API_TOKEN"]
 
 
-# Valid Wellfound role slugs that match our search profile.
-# These are actual predefined roles on wellfound.com — arbitrary slugs return 404.
-# Update this list if search_keywords change significantly.
-DEFAULT_WELLFOUND_ROLES = [
-    "automation-engineer",
-    "artificial-intelligence-engineer",
-    "software-engineer",
-    "devops-engineer",
-    "full-stack-engineer",
-    "backend-engineer",
-    "data-engineer",
-    "machine-learning-engineer",
-]
+def _keyword_to_slug(keyword: str) -> str:
+    """Convert a search keyword to a Wellfound role slug.
 
-
-def _build_urls(profile: dict | None = None) -> list[str]:
-    """Build Wellfound search URLs from profile config or defaults.
-
-    If profile contains 'wellfound_urls' (list of full URLs), use those directly.
-    Otherwise fall back to DEFAULT_WELLFOUND_ROLES.
+    'AI automation engineer' → 'ai-automation-engineer'
     """
-    if profile and profile.get("wellfound_urls"):
-        return profile["wellfound_urls"]
-
-    return [
-        f"https://wellfound.com/role/r/{slug}"
-        for slug in DEFAULT_WELLFOUND_ROLES
-    ]
+    slug = keyword.lower().strip()
+    slug = re.sub(r"[^a-z0-9\s-]", "", slug)
+    slug = re.sub(r"\s+", "-", slug)
+    return slug
 
 
-def run_actor(profile: dict | None = None) -> str:
+def _build_urls(keywords: list[str]) -> list[str]:
+    """Build Wellfound search URLs from keywords.
+
+    Converts each keyword into a role slug URL.
+    Deduplicates slugs (e.g. 'backend engineer' and 'Backend Engineer' → one URL).
+    """
+    seen: set[str] = set()
+    urls: list[str] = []
+    for kw in keywords:
+        slug = _keyword_to_slug(kw)
+        if slug and slug not in seen:
+            seen.add(slug)
+            urls.append(f"https://wellfound.com/role/r/{slug}")
+    return urls
+
+
+def run_actor(keywords: list[str]) -> str:
     url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
     params = {"token": _get_token()}
-    search_urls = _build_urls(profile)
+    search_urls = _build_urls(keywords)
 
     actor_input = {
         "urls": search_urls,
-        "pageLimit": 3,
+        "pageLimit": 1,
         "onlyRemoteJobs": True,
         "sortBy": "LAST_POSTED",
     }
-    logger.info(f"Starting Wellfound actor run with {len(search_urls)} URLs...")
+    logger.info(f"Starting Wellfound actor run with {len(search_urls)} keyword URLs (pageLimit=1)...")
     resp = httpx.post(url, json=actor_input, params=params, timeout=30)
     if resp.status_code >= 400:
         logger.error(f"Wellfound actor start failed ({resp.status_code}): {resp.text[:500]}")
@@ -183,17 +181,17 @@ def normalise_wellfound(raw: dict) -> dict:
 def run_search(keywords: list[str], profile: dict | None = None) -> list[dict]:
     """Full flow: trigger → wait → fetch → normalise.
 
-    keywords arg is accepted for interface consistency with other scrapers
-    but ignored — Wellfound uses predefined role URLs, not free-text search.
-    Pass profile to allow custom wellfound_urls from profile config.
+    Converts keywords to Wellfound role-slug URLs.
+    profile arg kept for interface consistency but no longer used for URLs.
     """
-    run_id = run_actor(profile)
+    run_id = run_actor(keywords)
     dataset_id = wait_for_run(run_id)
     raw_items = fetch_dataset(dataset_id)
     return [normalise_wellfound(item) for item in raw_items]
 
 
 if __name__ == "__main__":
-    jobs = run_search([])
+    test_keywords = ["software engineer", "automation engineer"]
+    jobs = run_search(test_keywords)
     print(json.dumps(jobs, ensure_ascii=False, indent=2))
     logger.info(f"Done. {len(jobs)} Wellfound jobs fetched.")

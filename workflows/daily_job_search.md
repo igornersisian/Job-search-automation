@@ -50,11 +50,15 @@ All 6 scrapers run **in parallel** via `ThreadPoolExecutor`:
 | 1 | LinkedIn | `run_apify_search.py` | `cheap_scraper/linkedin-job-scraper` | LinkedIn | ~$1.00 |
 | 2 | Glassdoor | `run_glassdoor_search.py` | `valig/glassdoor-jobs-scraper` | Glassdoor | ~$1.00 |
 | 3 | Indeed | `run_indeed_search.py` | `valig/indeed-jobs-scraper` | Indeed | ~$1.00 |
-| 4 | Wellfound | `run_wellfound_search.py` | `clearpath/wellfound-api-ppe` | Wellfound (AngelList) | ~$1.00 |
+| 4 | Wellfound | `run_wellfound_search.py` | `clearpath/wellfound-api-ppe` | Wellfound (AngelList) | ~$0.15 (pageLimit=1, keywords→slugs) |
 | 5 | RemoteBoards | `run_remoteboards_search.py` | `zyncodltd/JobsFlow` | RemoteOK, Remotive, WeWorkRemotely | $0.01 |
 | 6 | ATS | `run_ats_search.py` | `jobo.world/ats-jobs-search` | Greenhouse, Lever, Workday, Ashby, Workable, SmartRecruiters, BambooHR, Rippling, Personio, JazzHR, Breezy HR, Recruitee, Polymer | $0.30 |
 
 **Total coverage:** 20+ job platforms in a single pipeline run.
+
+### Wellfound keyword→slug caveat
+
+Wellfound doesn't support free-text search — it uses fixed role-category URLs like `wellfound.com/role/r/automation-engineer`. The pipeline converts `search_keywords` to URL slugs automatically (`_keyword_to_slug()`), but many keywords won't map to real Wellfound categories and will simply return 0 results. This is harmless (no errors, no wasted cost beyond the actor start) but means Wellfound coverage depends on how "role-like" the keywords are. If this becomes a problem, consider a mapping layer from keywords to known Wellfound role slugs.
 
 ## Flow
 
