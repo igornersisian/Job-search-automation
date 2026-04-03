@@ -392,8 +392,8 @@ async def cmd_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
         else:
             await update.message.reply_text(
-                "No custom keywords set. Using defaults.\n"
-                "To set: /keywords AI workflow, n8n, automation"
+                "⚠️ No keywords set. Pipeline won't run without them.\n"
+                "Set keywords: /keywords AI workflow, n8n, automation"
             )
         return
 

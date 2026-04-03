@@ -6,6 +6,7 @@ Run once per weekday morning. Fetch remote jobs posted in the last 24h from 6 so
 ## Prerequisites
 - `.env` filled with all required keys (see `.env` file)
 - Resume profile saved in Supabase `profile` table (send PDF to Telegram bot)
+- Search keywords set via `/keywords` bot command (no defaults — pipeline won't run without them)
 - Supabase tables created (see **Database Setup** below)
 - Apify account with sufficient credits
 
@@ -88,6 +89,7 @@ Wellfound doesn't support free-text search — it uses fixed role-category URLs 
 
 - **Apify actor changes output schema**: check normalise function in corresponding `run_*_search.py`
 - **Profile missing**: pipeline aborts cleanly with error. Fix: send PDF to Telegram bot
+- **Keywords missing**: pipeline aborts, sends Telegram notification. Fix: `/keywords` bot command
 - **OpenAI rate limit**: score_job will raise exception → job saved as `score_error`, pipeline continues
 - **Telegram send fails**: job saved as `notify_failed`, pipeline continues
 - **No new jobs found**: pipeline completes, sends summary with 0 sent

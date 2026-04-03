@@ -34,7 +34,7 @@ from run_wellfound_search import run_search as run_wellfound_search
 from run_remoteboards_search import run_search as run_remoteboards_search
 from run_ats_search import run_search as run_ats_search
 from score_job import score_job, quick_score, is_junior_or_intern
-from notify_telegram import send_job_card, send_daily_summary
+from notify_telegram import send_job_card, send_daily_summary, send_message
 
 load_dotenv()
 
@@ -133,17 +133,6 @@ DEDUP_SIMILARITY_THRESHOLD = 0.45
 
 
 DEFAULT_SCORE_THRESHOLD = 70
-
-DEFAULT_KEYWORDS = [
-    "AI workflow",
-    "n8n",
-    "automation engineer",
-    "no-code automation engineer",
-    "AI automation engineer",
-    "workflow automation",
-    "AI agent developer",
-    "vibe coding developer",
-]
 
 _supabase: Client | None = None
 
@@ -313,8 +302,12 @@ def run_pipeline() -> None:
     threshold = profile.get("score_threshold") or DEFAULT_SCORE_THRESHOLD
     logger.info(f"Score threshold: {threshold}%")
 
-    # Use custom keywords from profile if set, otherwise defaults
-    keywords = profile.get("search_keywords") or DEFAULT_KEYWORDS
+    # Keywords must be set by user via /keywords bot command
+    keywords = profile.get("search_keywords")
+    if not keywords:
+        logger.error("No search keywords set. Use /keywords command in Telegram bot first.")
+        send_message("⚠️ Pipeline skipped — no search keywords set.\nUse /keywords to add them.")
+        return
     logger.info(f"Search keywords ({len(keywords)}): {keywords}")
 
     # ── Phase 0: Fetch jobs from all sources in parallel ─────────────
