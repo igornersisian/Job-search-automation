@@ -100,15 +100,31 @@ def get_job_by_url(url: str) -> dict | None:
     return None
 
 
-def _extract_job_url_from_message(text: str) -> str | None:
-    """Extract job URL from a job card message (the [Open job](url) link)."""
-    if not text:
-        return None
-    # Match Markdown link: [Open job](url)
+def _extract_job_url_from_message(message) -> str | None:
+    """Extract job URL from a job card message.
+
+    Telegram renders Markdown links like [Open job](url) into entities
+    of type 'text_link', so reply.text contains just "Open job" without
+    the URL.  We check entities first, then fall back to raw text patterns.
+    """
+    # 1. Check entities for text_link (rendered Markdown links)
+    entities = message.entities or []
+    text = message.text or ""
+    for ent in entities:
+        if ent.type == "text_link" and ent.url:
+            return ent.url
+        if ent.type == "url":
+            # Plain URL pasted in text
+            url = text[ent.offset : ent.offset + ent.length]
+            if url.startswith("http"):
+                return url
+
+    # 2. Fallback: raw Markdown syntax (shouldn't happen but just in case)
     m = re.search(r'\[Open job\]\(([^)]+)\)', text)
     if m:
         return m.group(1)
-    # Fallback: look for common job board URLs in plain text
+
+    # 3. Fallback: common job board URLs in plain text
     m = re.search(r'(https?://(?:www\.)?(?:linkedin\.com|glassdoor\.com|indeed\.com|wellfound\.com)\S+)', text)
     if m:
         return m.group(1)
@@ -718,7 +734,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # If user replies to a job card message, load that job as active context
     reply = update.message.reply_to_message
     if reply and reply.text:
-        job_url = _extract_job_url_from_message(reply.text)
+        job_url = _extract_job_url_from_message(reply)
         if job_url:
             job_from_db = get_job_by_url(job_url)
             if job_from_db:
