@@ -551,7 +551,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         total = len(rows)
         sent = sum(1 for r in rows if r["status"] == "sent")
         low_score = sum(1 for r in rows if r["status"] == "low_score")
-        junior = sum(1 for r in rows if r["status"] == "filtered_junior")
+        excluded = sum(1 for r in rows if r["status"] in ("filtered_junior", "filtered_excluded"))
         dupes = sum(1 for r in rows if r["status"] == "duplicate")
         errors = sum(1 for r in rows if r["status"] in ("score_error", "notify_failed"))
 
@@ -573,7 +573,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"📊 Total processed: {total}\n"
             f"✅ Sent (suitable): {sent}\n"
             f"🔕 Low score: {low_score}\n"
-            f"🚫 Junior/intern: {junior}\n"
+            f"🚫 Excluded by title: {excluded}\n"
             f"❌ Errors: {errors}\n\n"
             f"📈 Match rate: {pct:.1f}%\n"
             f"📅 Days active: {days_active}\n"
