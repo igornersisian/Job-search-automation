@@ -169,9 +169,17 @@ def get_profile() -> dict | None:
     return None
 
 
-def is_already_seen(job_id: str) -> bool:
-    result = get_supabase().table("jobs").select("id").eq("id", job_id).execute()
-    return len(result.data) > 0
+def fetch_existing_ids(job_ids: list[str]) -> set[str]:
+    """Batch-check which job IDs already exist in Supabase.
+    Queries in chunks to avoid URL length limits.
+    """
+    existing: set[str] = set()
+    chunk_size = 200
+    for i in range(0, len(job_ids), chunk_size):
+        chunk = job_ids[i : i + chunk_size]
+        result = get_supabase().table("jobs").select("id").in_("id", chunk).execute()
+        existing.update(row["id"] for row in result.data)
+    return existing
 
 
 def save_job(job: dict, status: str) -> None:
@@ -325,6 +333,11 @@ def run_pipeline() -> None:
     dupes_local = 0      # same ID appeared multiple times this run
     dupes_fuzzy = 0      # same title+company with similar description
 
+    # Batch-fetch existing IDs from Supabase (1-2 queries instead of N)
+    all_raw_ids = [r.get("id", "") for r in raw_jobs if r.get("id")]
+    already_seen_ids = fetch_existing_ids(all_raw_ids) if all_raw_ids else set()
+    logger.info(f"Batch dedup: {len(already_seen_ids)} already seen out of {len(all_raw_ids)} raw IDs")
+
     processed_ids: set[str] = set()
     # Smart dedup: group jobs by normalised title+company, then check description similarity
     # Key: "normalised_title|normalised_company" → list of jobs with that key
@@ -337,7 +350,7 @@ def run_pipeline() -> None:
             continue
 
         # Dedup: Supabase (cross-run, catches jobs from previous days)
-        if is_already_seen(job["id"]):
+        if job["id"] in already_seen_ids:
             dupes_crossrun += 1
             continue
 
