@@ -3,13 +3,16 @@ Daily pipeline orchestrator.
 
 Flow:
   1. Run Apify LinkedIn + Glassdoor + Indeed + Wellfound searches IN PARALLEL
-  2. For each job:
-     a. Deduplicate via Supabase
+  2. Shuffle results to interleave sources
+  3. For each job:
+     a. Deduplicate via Supabase + local sets (by ID and title+company)
      b. Filter internship/junior
-     c. Quick score (cheap, score-only) vs resume profile
-     d. If score >= 70 → full analysis → send Telegram card + save as "sent"
-     e. Else → save as "low_score" (no full analysis, no wasted tokens)
-  3. Send daily summary to Telegram
+     c. Quick score (cheap, score-only) vs resume profile — authoritative score
+     d. If score >= threshold → enrich (match_summary, red_flags) → send Telegram card
+     e. Else → save as "low_score" (no enrichment, no wasted tokens)
+  4. Send daily summary to Telegram
+
+Score threshold is configurable via /threshold bot command (stored in profile).
 
 Usage:
     python tools/process_jobs.py
@@ -18,6 +21,7 @@ Usage:
 import os
 import sys
 import json
+import random
 import logging
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -42,7 +46,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-SCORE_THRESHOLD = 70
+DEFAULT_SCORE_THRESHOLD = 70
 
 DEFAULT_KEYWORDS = [
     "AI workflow",
@@ -170,6 +174,10 @@ def run_pipeline() -> None:
         logger.error("No resume profile in Supabase. Send PDF to Telegram bot first.")
         return
 
+    # Configurable threshold from profile (set via /threshold bot command)
+    threshold = profile.get("score_threshold") or DEFAULT_SCORE_THRESHOLD
+    logger.info(f"Score threshold: {threshold}%")
+
     # Use custom keywords from profile if set, otherwise defaults
     keywords = profile.get("search_keywords") or DEFAULT_KEYWORDS
     logger.info(f"Search keywords ({len(keywords)}): {keywords}")
@@ -183,10 +191,17 @@ def run_pipeline() -> None:
 
     logger.info(f"Total raw jobs: {len(raw_jobs)}")
 
+    # Shuffle to interleave sources (not all-LinkedIn → all-Glassdoor → ...)
+    random.shuffle(raw_jobs)
+
     sent = 0
     skipped_dupe = 0
     skipped_junior = 0
     skipped_score = 0
+
+    # Local dedup within this pipeline run
+    processed_ids: set[str] = set()
+    processed_titles: set[str] = set()
 
     for raw in raw_jobs:
         job = normalise_job(raw)
@@ -194,10 +209,24 @@ def run_pipeline() -> None:
         if not job["id"] or not job["title"]:
             continue
 
-        # Deduplication
+        # Dedup: Supabase (cross-run, catches jobs from previous days)
         if is_already_seen(job["id"]):
             skipped_dupe += 1
             continue
+
+        # Dedup: local by ID (within this run — same job from same source)
+        if job["id"] in processed_ids:
+            skipped_dupe += 1
+            continue
+
+        # Dedup: local by title+company (cross-source — same job on LinkedIn + Indeed)
+        dedup_key = f"{job['title'].lower().strip()}|{job['company'].lower().strip()}"
+        if dedup_key in processed_titles:
+            skipped_dupe += 1
+            continue
+
+        processed_ids.add(job["id"])
+        processed_titles.add(dedup_key)
 
         # Junior/intern filter
         if is_junior_or_intern(job):
@@ -206,7 +235,7 @@ def run_pipeline() -> None:
             skipped_junior += 1
             continue
 
-        # Step 1: Quick score (cheap — score number only)
+        # Quick score (cheap — score number only, AUTHORITATIVE)
         try:
             score = quick_score(job, profile)
         except Exception as e:
@@ -215,28 +244,20 @@ def run_pipeline() -> None:
             continue
 
         job["score"] = score
-        logger.info(f"[{score}/100] {job['title']} @ {job['company']}")
+        logger.info(f"[{score}/100] {job['title']} @ {job['company']} ({job['source']})")
 
-        if score < SCORE_THRESHOLD:
+        if score < threshold:
             save_job(job, "low_score")
             skipped_score += 1
             continue
 
-        # Step 2: Full analysis (only for jobs above threshold)
+        # Enrich: match_summary + red_flags (only for jobs above threshold, no re-scoring)
         try:
             job = score_job(job, profile)
         except Exception as e:
-            logger.error(f"Analysis failed for {job['title']}: {e}")
-            # Still send — we already have the score
+            logger.error(f"Enrichment failed for {job['title']}: {e}")
             job["match_summary"] = ""
             job["red_flags"] = []
-
-        # Re-check: full analysis may lower the score below threshold
-        if job.get("score", 0) < SCORE_THRESHOLD:
-            logger.info(f"[DROPPED] {job['title']} — full score {job['score']} < {SCORE_THRESHOLD}")
-            save_job(job, "low_score")
-            skipped_score += 1
-            continue
 
         # Send to Telegram
         if send_job_card(job):
@@ -257,6 +278,7 @@ def run_pipeline() -> None:
         skipped_score=skipped_score,
         skipped_junior=skipped_junior,
         skipped_dupe=skipped_dupe,
+        threshold=threshold,
     )
 
 

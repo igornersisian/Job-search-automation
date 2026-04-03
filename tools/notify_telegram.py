@@ -100,12 +100,12 @@ def send_job_card(job: dict) -> bool:
         return False
 
 
-def send_daily_summary(sent: int, skipped_score: int, skipped_junior: int, skipped_dupe: int) -> None:
+def send_daily_summary(sent: int, skipped_score: int, skipped_junior: int, skipped_dupe: int, threshold: int = 70) -> None:
     """Send a brief daily pipeline summary."""
     text = (
         f"*Daily job search complete*\n"
         f"✅ Sent to you: {sent}\n"
-        f"🔕 Low score (<70): {skipped_score}\n"
+        f"🔕 Low score (<{threshold}%): {skipped_score}\n"
         f"🚫 Junior/intern filtered: {skipped_junior}\n"
         f"♻️ Duplicates skipped: {skipped_dupe}"
     )

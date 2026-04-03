@@ -92,8 +92,8 @@ def quick_score(job: dict, profile: dict) -> int:
 
 def score_job(job: dict, profile: dict) -> dict:
     """
-    Full analysis for jobs above threshold. Returns job dict enriched with:
-      score, match_summary, red_flags
+    Enrichment-only analysis for jobs that already passed quick_score threshold.
+    Adds match_summary and red_flags. Does NOT override score — quick_score is authoritative.
     """
     job_text = (
         f"Title: {job.get('title', 'N/A')}\n"
@@ -119,17 +119,10 @@ def score_job(job: dict, profile: dict) -> dict:
                     "years of work, skills, or projects that are not written in the profile.\n"
                     "- If something is not mentioned in the profile, treat it as absent — "
                     "do not guess or extrapolate.\n"
-                    "- When citing candidate experience in red_flags or match_summary, "
-                    "quote the actual profile data.\n\n"
+                    "- When citing candidate experience, quote the actual profile data.\n\n"
                     "Return a JSON object with:\n"
-                    "- score: int 0-100 (how well the candidate fits this role)\n"
                     "- match_summary: string (1-2 sentences on why this is or isn't a good fit)\n"
                     "- red_flags: list of strings (concerns, missing requirements, or mismatches)\n\n"
-                    "Scoring guide:\n"
-                    "90-100: Excellent match, candidate clearly qualifies\n"
-                    "70-89: Good match, meets most requirements\n"
-                    "50-69: Partial match, some gaps\n"
-                    "0-49: Poor match\n\n"
                     "Return only valid JSON."
                 ),
             },
@@ -144,7 +137,7 @@ def score_job(job: dict, profile: dict) -> dict:
     )
 
     result = json.loads(response.choices[0].message.content)
-    job["score"] = result.get("score", 0)
+    # Do NOT override job["score"] — quick_score is the authoritative score
     job["match_summary"] = result.get("match_summary", "")
     job["red_flags"] = result.get("red_flags", [])
     return job

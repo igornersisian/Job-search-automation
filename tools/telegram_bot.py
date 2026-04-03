@@ -123,6 +123,27 @@ def save_search_keywords(keywords: list[str]) -> None:
     }).eq("id", 1).execute()
 
 
+def get_score_threshold() -> int:
+    """Return the score threshold from profile, or default 70."""
+    profile = get_profile()
+    if profile:
+        return profile.get("score_threshold") or 70
+    return 70
+
+
+def save_score_threshold(threshold: int) -> None:
+    """Save score threshold into the profile's parsed JSONB."""
+    profile = get_profile()
+    if not profile:
+        logger.error("No profile found — upload resume first")
+        return
+    profile["score_threshold"] = threshold
+    get_supabase().table("profile").update({
+        "parsed": profile,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", 1).execute()
+
+
 # ---------------------------------------------------------------------------
 # PDF parsing
 # ---------------------------------------------------------------------------
@@ -258,14 +279,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/help — this message\n"
         "/status — show your current profile summary\n"
         "/keywords — set search keywords (comma-separated)\n"
+        "/threshold — set minimum score % to send (default 70)\n"
         "/fetch\\_jobs — manually run the job search pipeline now\n"
         "/job <url> — analyze a specific job URL and set it as active context\n\n"
         "*How to use:*\n"
         "1. Send your resume PDF — I'll parse and remember it\n"
         "2. Set keywords: /keywords AI workflow, n8n, automation\n"
-        "3. Every morning I'll send you matching job cards\n"
-        "4. After seeing a card, ask me anything\n"
-        "5. Use /job <url> to load any job for discussion",
+        "3. Set threshold: /threshold 75\n"
+        "4. Every morning I'll send you matching job cards\n"
+        "5. After seeing a card, ask me anything\n"
+        "6. Use /job <url> to load any job for discussion",
         parse_mode="Markdown",
     )
 
@@ -321,6 +344,31 @@ async def cmd_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         f"Search keywords saved ({len(keywords)}):\n" + ", ".join(keywords)
     )
+
+
+async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set or show the minimum score threshold for sending jobs."""
+    if not context.args:
+        threshold = get_score_threshold()
+        await update.message.reply_text(
+            f"*Current threshold:* {threshold}%\n\n"
+            "To change: /threshold 75",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        value = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Threshold must be a number (0-100).")
+        return
+
+    if not 0 <= value <= 100:
+        await update.message.reply_text("Threshold must be between 0 and 100.")
+        return
+
+    save_score_threshold(value)
+    await update.message.reply_text(f"Score threshold set to {value}%")
 
 
 async def cmd_fetch_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -527,6 +575,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("keywords", cmd_keywords))
+    app.add_handler(CommandHandler("threshold", cmd_threshold))
     app.add_handler(CommandHandler("fetch_jobs", cmd_fetch_jobs))
     app.add_handler(CommandHandler("job", cmd_job))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
