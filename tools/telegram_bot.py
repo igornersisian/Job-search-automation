@@ -144,6 +144,27 @@ def save_score_threshold(threshold: int) -> None:
     }).eq("id", 1).execute()
 
 
+def get_custom_red_flags() -> list[str]:
+    """Return custom dealbreakers from profile."""
+    profile = get_profile()
+    if profile:
+        return profile.get("custom_red_flags") or []
+    return []
+
+
+def save_custom_red_flags(flags: list[str]) -> None:
+    """Save custom dealbreakers into the profile's parsed JSONB."""
+    profile = get_profile()
+    if not profile:
+        logger.error("No profile found — upload resume first")
+        return
+    profile["custom_red_flags"] = flags
+    get_supabase().table("profile").update({
+        "parsed": profile,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", 1).execute()
+
+
 # ---------------------------------------------------------------------------
 # PDF parsing
 # ---------------------------------------------------------------------------
@@ -280,6 +301,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status — show your current profile summary\n"
         "/keywords — set search keywords (comma-separated)\n"
         "/threshold — set minimum score % to send (default 70)\n"
+        "/redflags — set dealbreakers (e.g. requires US work permit)\n"
         "/fetch\\_jobs — manually run the job search pipeline now\n"
         "/job <url> — analyze a specific job URL and set it as active context\n\n"
         "*How to use:*\n"
@@ -344,6 +366,45 @@ async def cmd_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         f"Search keywords saved ({len(keywords)}):\n" + ", ".join(keywords)
     )
+
+
+async def cmd_redflags(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set, show, or clear custom dealbreakers for job scoring."""
+    if not context.args:
+        flags = get_custom_red_flags()
+        if flags:
+            lines = "\n".join(f"• {f}" for f in flags)
+            await update.message.reply_text(
+                f"*Your dealbreakers:*\n{lines}\n\n"
+                "To replace: /redflags requires US work permit, on-site only\n"
+                "To clear: /redflags clear",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "No custom dealbreakers set.\n"
+                "To add: /redflags requires US work permit, on-site only"
+            )
+        return
+
+    raw_text = " ".join(context.args)
+
+    if raw_text.strip().lower() == "clear":
+        save_custom_red_flags([])
+        await update.message.reply_text("Custom dealbreakers cleared.")
+        return
+
+    flags = [f.strip() for f in raw_text.split(",") if f.strip()]
+    if not flags:
+        await update.message.reply_text(
+            "Send dealbreakers separated by commas:\n"
+            "/redflags requires US work permit, on-site only, requires clearance"
+        )
+        return
+
+    save_custom_red_flags(flags)
+    lines = "\n".join(f"• {f}" for f in flags)
+    await update.message.reply_text(f"Dealbreakers saved ({len(flags)}):\n{lines}")
 
 
 async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -576,6 +637,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("keywords", cmd_keywords))
     app.add_handler(CommandHandler("threshold", cmd_threshold))
+    app.add_handler(CommandHandler("redflags", cmd_redflags))
     app.add_handler(CommandHandler("fetch_jobs", cmd_fetch_jobs))
     app.add_handler(CommandHandler("job", cmd_job))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))

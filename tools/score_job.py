@@ -67,6 +67,15 @@ def quick_score(job: dict, profile: dict) -> int:
     )
     profile_text = json.dumps(profile, indent=2)
 
+    # Custom dealbreakers from profile
+    dealbreakers = profile.get("custom_red_flags") or []
+    dealbreakers_text = ""
+    if dealbreakers:
+        items = "\n".join(f"- {d}" for d in dealbreakers)
+        dealbreakers_text = (
+            f"\n\nCANDIDATE DEALBREAKERS (if ANY of these apply, score below 30):\n{items}"
+        )
+
     response = get_openai().chat.completions.create(
         model="gpt-4.1-mini",
         response_format={"type": "json_object"},
@@ -82,7 +91,7 @@ def quick_score(job: dict, profile: dict) -> int:
             },
             {
                 "role": "user",
-                "content": f"PROFILE:\n{profile_text}\n\nJOB:\n{job_text}",
+                "content": f"PROFILE:\n{profile_text}\n\nJOB:\n{job_text}{dealbreakers_text}",
             },
         ],
     )
@@ -104,6 +113,15 @@ def score_job(job: dict, profile: dict) -> dict:
     )
 
     profile_text = json.dumps(profile, indent=2)
+
+    # Custom dealbreakers from profile
+    dealbreakers = profile.get("custom_red_flags") or []
+    dealbreakers_text = ""
+    if dealbreakers:
+        items = "\n".join(f"- {d}" for d in dealbreakers)
+        dealbreakers_text = (
+            f"\n\nCANDIDATE DEALBREAKERS (flag these in red_flags if they apply):\n{items}"
+        )
 
     response = get_openai().chat.completions.create(
         model="gpt-4.1-mini",
@@ -130,7 +148,7 @@ def score_job(job: dict, profile: dict) -> dict:
                 "role": "user",
                 "content": (
                     f"CANDIDATE PROFILE:\n{profile_text}\n\n"
-                    f"JOB POSTING:\n{job_text}"
+                    f"JOB POSTING:\n{job_text}{dealbreakers_text}"
                 ),
             },
         ],

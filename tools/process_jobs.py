@@ -3,16 +3,12 @@ Daily pipeline orchestrator.
 
 Flow:
   1. Run Apify LinkedIn + Glassdoor + Indeed + Wellfound searches IN PARALLEL
-  2. Shuffle results to interleave sources
-  3. For each job:
-     a. Deduplicate via Supabase + local sets (by ID and title+company)
-     b. Filter internship/junior
-     c. Quick score (cheap, score-only) vs resume profile — authoritative score
-     d. If score >= threshold → enrich (match_summary, red_flags) → send Telegram card
-     e. Else → save as "low_score" (no enrichment, no wasted tokens)
+  2. Phase 1 (fast, sequential): dedup by ID + title+company, junior filter
+  3. Phase 2 (PARALLEL): quick_score + enrich + send Telegram — all jobs at once
   4. Send daily summary to Telegram
 
-Score threshold is configurable via /threshold bot command (stored in profile).
+Score threshold configurable via /threshold bot command.
+Custom dealbreakers via /redflags bot command.
 
 Usage:
     python tools/process_jobs.py
@@ -21,7 +17,6 @@ Usage:
 import os
 import sys
 import json
-import random
 import logging
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -162,6 +157,43 @@ def _fetch_all_sources(keywords: list[str], profile: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Single-job processor (runs inside thread pool)
+# ---------------------------------------------------------------------------
+
+def _process_single_job(job: dict, profile: dict, threshold: int) -> tuple[dict, str]:
+    """Score → enrich → send one job. Returns (job, status_label).
+
+    Runs in a worker thread — no shared mutable state.
+    """
+    # Quick score (cheap, authoritative)
+    try:
+        score = quick_score(job, profile)
+    except Exception as e:
+        logger.error(f"Scoring failed for {job['title']}: {e}")
+        return job, "score_error"
+
+    job["score"] = score
+    logger.info(f"[{score}/100] {job['title']} @ {job['company']} ({job['source']})")
+
+    if score < threshold:
+        return job, "low_score"
+
+    # Enrich: match_summary + red_flags (no re-scoring)
+    try:
+        job = score_job(job, profile)
+    except Exception as e:
+        logger.error(f"Enrichment failed for {job['title']}: {e}")
+        job["match_summary"] = ""
+        job["red_flags"] = []
+
+    # Send to Telegram
+    if send_job_card(job):
+        return job, "sent"
+    else:
+        return job, "notify_failed"
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -182,7 +214,7 @@ def run_pipeline() -> None:
     keywords = profile.get("search_keywords") or DEFAULT_KEYWORDS
     logger.info(f"Search keywords ({len(keywords)}): {keywords}")
 
-    # Fetch jobs from all sources in parallel
+    # ── Phase 0: Fetch jobs from all sources in parallel ─────────────
     raw_jobs = _fetch_all_sources(keywords, profile)
 
     if not raw_jobs:
@@ -191,15 +223,11 @@ def run_pipeline() -> None:
 
     logger.info(f"Total raw jobs: {len(raw_jobs)}")
 
-    # Shuffle to interleave sources (not all-LinkedIn → all-Glassdoor → ...)
-    random.shuffle(raw_jobs)
-
-    sent = 0
+    # ── Phase 1: Dedup + junior filter (fast, sequential, no API calls) ──
+    candidates: list[dict] = []
     skipped_dupe = 0
     skipped_junior = 0
-    skipped_score = 0
 
-    # Local dedup within this pipeline run
     processed_ids: set[str] = set()
     processed_titles: set[str] = set()
 
@@ -235,36 +263,39 @@ def run_pipeline() -> None:
             skipped_junior += 1
             continue
 
-        # Quick score (cheap — score number only, AUTHORITATIVE)
-        try:
-            score = quick_score(job, profile)
-        except Exception as e:
-            logger.error(f"Scoring failed for {job['title']}: {e}")
-            save_job(job, "score_error")
-            continue
+        candidates.append(job)
 
-        job["score"] = score
-        logger.info(f"[{score}/100] {job['title']} @ {job['company']} ({job['source']})")
+    logger.info(
+        f"Phase 1 done — {len(candidates)} candidates, "
+        f"{skipped_dupe} dupes, {skipped_junior} junior filtered"
+    )
 
-        if score < threshold:
-            save_job(job, "low_score")
-            skipped_score += 1
-            continue
+    # ── Phase 2: Score + enrich + send IN PARALLEL ───────────────────
+    sent = 0
+    skipped_score = 0
+    errors = 0
 
-        # Enrich: match_summary + red_flags (only for jobs above threshold, no re-scoring)
-        try:
-            job = score_job(job, profile)
-        except Exception as e:
-            logger.error(f"Enrichment failed for {job['title']}: {e}")
-            job["match_summary"] = ""
-            job["red_flags"] = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {
+            executor.submit(_process_single_job, job, profile, threshold): job
+            for job in candidates
+        }
 
-        # Send to Telegram
-        if send_job_card(job):
-            save_job(job, "sent")
-            sent += 1
-        else:
-            save_job(job, "notify_failed")
+        for future in as_completed(futures):
+            job, status = future.result()
+
+            if status == "sent":
+                save_job(job, "sent")
+                sent += 1
+            elif status == "low_score":
+                save_job(job, "low_score")
+                skipped_score += 1
+            elif status == "notify_failed":
+                save_job(job, "notify_failed")
+                errors += 1
+            elif status == "score_error":
+                save_job(job, "score_error")
+                errors += 1
 
     logger.info(
         f"Pipeline done — sent: {sent}, "
