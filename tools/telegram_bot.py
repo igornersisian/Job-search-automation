@@ -302,6 +302,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/keywords — set search keywords (comma-separated)\n"
         "/threshold — set minimum score % to send (default 70)\n"
         "/redflags — set dealbreakers (e.g. requires US work permit)\n"
+        "/stats — all-time job search statistics\n"
         "/fetch\\_jobs — manually run the job search pipeline now\n"
         "/job <url> — analyze a specific job URL and set it as active context\n\n"
         "*How to use:*\n"
@@ -430,6 +431,56 @@ async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     save_score_threshold(value)
     await update.message.reply_text(f"Score threshold set to {value}%")
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show all-time job search statistics."""
+    try:
+        sb = get_supabase()
+
+        # Total processed jobs
+        all_jobs = sb.table("jobs").select("id, status, created_at").execute()
+        rows = all_jobs.data or []
+
+        if not rows:
+            await update.message.reply_text("No jobs processed yet.")
+            return
+
+        total = len(rows)
+        sent = sum(1 for r in rows if r["status"] == "sent")
+        low_score = sum(1 for r in rows if r["status"] == "low_score")
+        junior = sum(1 for r in rows if r["status"] == "filtered_junior")
+        dupes = sum(1 for r in rows if r["status"] == "duplicate")
+        errors = sum(1 for r in rows if r["status"] in ("score_error", "notify_failed"))
+
+        # Percentage
+        pct = (sent / total * 100) if total else 0
+
+        # Average per day: count distinct dates among sent jobs
+        sent_dates = set()
+        for r in rows:
+            if r["status"] == "sent" and r.get("created_at"):
+                day = r["created_at"][:10]  # "2026-04-03"
+                sent_dates.add(day)
+
+        days_active = len(sent_dates) or 1
+        avg_per_day = sent / days_active
+
+        await update.message.reply_text(
+            f"*All-time statistics*\n\n"
+            f"📊 Total processed: {total}\n"
+            f"✅ Sent (suitable): {sent}\n"
+            f"🔕 Low score: {low_score}\n"
+            f"🚫 Junior/intern: {junior}\n"
+            f"❌ Errors: {errors}\n\n"
+            f"📈 Match rate: {pct:.1f}%\n"
+            f"📅 Days with results: {days_active}\n"
+            f"📬 Avg per day: {avg_per_day:.1f}",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
+        await update.message.reply_text(f"Failed to load stats: {e}")
 
 
 async def cmd_fetch_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -638,6 +689,7 @@ def main() -> None:
     app.add_handler(CommandHandler("keywords", cmd_keywords))
     app.add_handler(CommandHandler("threshold", cmd_threshold))
     app.add_handler(CommandHandler("redflags", cmd_redflags))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("fetch_jobs", cmd_fetch_jobs))
     app.add_handler(CommandHandler("job", cmd_job))
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
