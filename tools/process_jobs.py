@@ -2,7 +2,8 @@
 Daily pipeline orchestrator.
 
 Flow:
-  1. Run Apify LinkedIn + Glassdoor + Indeed + Wellfound searches IN PARALLEL
+  1. Run all scrapers IN PARALLEL:
+     LinkedIn, Glassdoor, Indeed, Wellfound, RemoteBoards, ATS (13 platforms)
   2. Phase 1 (fast, sequential): dedup by ID + title+company, junior filter
   3. Phase 2 (PARALLEL): quick_score + enrich + send Telegram — all jobs at once
   4. Send daily summary to Telegram
@@ -30,6 +31,8 @@ from run_apify_search import run_search as run_linkedin_search
 from run_glassdoor_search import run_search as run_glassdoor_search
 from run_indeed_search import run_search as run_indeed_search
 from run_wellfound_search import run_search as run_wellfound_search
+from run_remoteboards_search import run_search as run_remoteboards_search
+from run_ats_search import run_search as run_ats_search
 from score_job import score_job, quick_score, is_junior_or_intern
 from notify_telegram import send_job_card, send_daily_summary
 
@@ -222,17 +225,21 @@ def _fetch_all_sources(keywords: list[str], profile: dict) -> list[dict]:
     """Run all scrapers in parallel, return merged job list."""
     raw_jobs: list[dict] = []
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         future_linkedin = executor.submit(run_linkedin_search, keywords)
         future_glassdoor = executor.submit(run_glassdoor_search, keywords)
         future_indeed = executor.submit(run_indeed_search, keywords)
         future_wellfound = executor.submit(run_wellfound_search, keywords, profile)
+        future_remoteboards = executor.submit(run_remoteboards_search, keywords)
+        future_ats = executor.submit(run_ats_search, keywords)
 
         for name, future in [
             ("LinkedIn", future_linkedin),
             ("Glassdoor", future_glassdoor),
             ("Indeed", future_indeed),
             ("Wellfound", future_wellfound),
+            ("RemoteBoards", future_remoteboards),
+            ("ATS", future_ats),
         ]:
             try:
                 jobs = future.result()
