@@ -1,12 +1,12 @@
 """
 Score a single job against the user's resume profile using OpenAI.
 
-Input:  job dict (from Apify), profile dict (from Supabase)
-Output: enriched job dict with score, match_summary, red_flags
+Input:  job dict (from scraper), profile dict (from Supabase)
+Output: enriched job dict with score, match_summary, red_flags, score_breakdown
 
-Two-step scoring:
-  1. quick_score() — returns just an int 0-100 (cheap, fast)
-  2. score_job()   — returns score + match_summary + red_flags (only for jobs above threshold)
+Single-pass scoring with chain-of-thought:
+  The model first writes match_summary + red_flags (forcing it to reason),
+  then assigns sub-scores that must be consistent with its own analysis.
 
 Usage (standalone):
     python tools/score_job.py '{"title": "...", "description": "..."}'
@@ -79,6 +79,7 @@ def _chat_completion(messages: list, max_retries: int = 3, **kwargs):
 
     raise last_error
 
+
 def is_excluded_by_title(job: dict, excluded_keywords: list[str]) -> bool:
     """Return True if job title contains any of the user-defined excluded keywords."""
     if not excluded_keywords:
@@ -99,21 +100,24 @@ _CAPS = {
 }
 
 
-def quick_score(job: dict, profile: dict) -> tuple[int, dict]:
-    """Structured two-block score. Returns (int 0-100, breakdown dict).
+def score_job(job: dict, profile: dict) -> dict:
+    """Single-pass scoring with chain-of-thought.
 
-    Block 1 — Domain & Capability Fit (max 60):
-      domain (0-25), patterns (0-20), role (0-15)
-    Block 2 — Formal Requirements Fit (max 40):
-      tools (0-15), experience (0-10), location (0-10), red_flags (0-5)
+    The model first writes match_summary + red_flags (its reasoning),
+    then assigns sub-scores consistent with that analysis.
 
-    Final score is recomputed server-side from sub-scores (LLM math not trusted).
+    Returns the job dict enriched with:
+      score (int 0-100), score_breakdown (dict), match_summary (str), red_flags (list)
     """
     # ── Deterministic guard: empty / too-short description ──
     description = (job.get("description") or "").strip()
     if len(description) < 50:
         logger.info(f"Empty/short description for '{job.get('title')}' — auto-score 0")
-        return 0, _EMPTY_BREAKDOWN
+        job["score"] = 0
+        job["score_breakdown"] = _EMPTY_BREAKDOWN
+        job["match_summary"] = "No job description available."
+        job["red_flags"] = ["No description"]
+        return job
 
     job_text = (
         f"Title: {job.get('title', 'N/A')}\n"
@@ -125,7 +129,7 @@ def quick_score(job: dict, profile: dict) -> tuple[int, dict]:
     # Custom dealbreakers from profile
     dealbreakers = profile.get("custom_red_flags") or []
 
-    # ── Build system prompt — structured two-block scoring ──
+    # ── Build system prompt ──
     system_content = (
         "You are a job-candidate fit evaluator. "
         "Score ONLY using facts explicitly stated in the candidate profile. "
@@ -142,21 +146,34 @@ def quick_score(job: dict, profile: dict) -> tuple[int, dict]:
         )
 
     system_content += (
-        "SCORING: Evaluate in TWO blocks. Total = Block1 + Block2 (max 100).\n\n"
+        "YOUR TASK — analyse the job against the candidate in THREE steps:\n\n"
 
-        "First, extract from the candidate profile:\n"
-        "- Their primary domain(s) (what field/industry they work in)\n"
-        "- Their approximate total years of professional experience\n"
-        "- Their seniority level (junior, mid, senior, lead, etc.)\n"
-        "- Their toolset and working style (what technologies they actually use)\n"
-        "Then compare against the job requirements.\n\n"
+        "STEP 1: Write match_summary (1-2 sentences).\n"
+        "Address the candidate directly (use 'you/your'). "
+        "State clearly whether this job fits or not and WHY. "
+        "Mention the most important match or mismatch.\n\n"
+
+        "STEP 2: List red_flags.\n"
+        "Every genuine concern, mismatch, or dealbreaker. "
+        "Include as many or as few as actually exist. "
+        "If zero real concerns, return an empty list. "
+        "Do NOT duplicate the same concern in different words.\n\n"
+
+        "STEP 3: Assign sub-scores.\n"
+        "Your scores MUST be consistent with your match_summary and red_flags above. "
+        "If you wrote that something is a problem, the corresponding score must be LOW. "
+        "If you flagged 'hybrid' as a red flag, location must be 0-2. "
+        "If you flagged seniority mismatch, role must reflect that.\n\n"
+
+        "SUB-SCORES:\n\n"
 
         "BLOCK 1 — Domain & Capability Fit (max 60 points):\n"
         "  domain (0-25): How well does the candidate's actual domain match the job's "
         "domain? Be precise about domain boundaries — adjacent-sounding fields can be "
         "very different in practice. For example: using AI APIs/integrations is different "
         "from building/training ML models; front-end web dev is different from embedded "
-        "systems; DevOps is different from software architecture. "
+        "systems; DevOps is different from software architecture; "
+        "product management is different from engineering. "
         "If the candidate works in a fundamentally different domain, score 0-5. "
         "If related but not the same, score 8-15. If strong match, score 18-25.\n"
         "  patterns (0-20): Does the candidate have experience with the architectural "
@@ -187,21 +204,29 @@ def quick_score(job: dict, profile: dict) -> tuple[int, dict]:
         "4 years short → penalty -20 → capped at 0. "
         "If the job does not mention years of experience, give 8.\n"
         "  location (0-10): Does the candidate's location/remote preference match? "
-        "If the job requires office presence, specific country residence, security "
-        "clearance, or work visa that the candidate cannot meet, give 0. "
-        "If job is remote-friendly with no geographic restrictions, give 10.\n"
-        "  red_flags (0-5): 5 = no concerns from candidate's dealbreaker list. "
-        "Deduct for each red flag that applies. 0 = multiple serious concerns.\n\n"
+        "If the job is hybrid, on-site, office-based, or requires specific country "
+        "residence/clearance/visa that the candidate cannot meet, give 0. "
+        "If job is fully remote with no geographic restrictions, give 10.\n"
+        "  red_flags (0-5): 5 = no concerns. "
+        "Deduct 1 for each red flag you listed above. 0 = multiple serious concerns.\n\n"
+
+        "CONSISTENCY RULE:\n"
+        "Before returning, re-read your match_summary and red_flags. "
+        "If you described a serious mismatch but gave a high score for that dimension, "
+        "FIX THE SCORE to match your analysis. Your text analysis is the truth — "
+        "the numbers must follow it, not the other way around.\n\n"
 
         "RULES:\n"
         "- Be conservative: when uncertain, score lower rather than higher\n"
-        "- Score 70+ total ONLY if the candidate could realistically compete\n"
-        "- The final score MUST equal the sum of all 7 sub-scores\n\n"
+        "- Score 70+ total ONLY if the candidate could realistically compete\n\n"
 
-        "Return ONLY this JSON:\n"
-        '{"block1": {"domain": <int>, "patterns": <int>, "role": <int>}, '
-        '"block2": {"tools": <int>, "experience": <int>, "location": <int>, '
-        '"red_flags": <int>}, "score": <int>}'
+        "Return ONLY this JSON (match_summary and red_flags FIRST, then scores):\n"
+        "{\n"
+        '  "match_summary": "<1-2 sentences>",\n'
+        '  "red_flags": ["<flag1>", ...],\n'
+        '  "block1": {"domain": <int>, "patterns": <int>, "role": <int>},\n'
+        '  "block2": {"tools": <int>, "experience": <int>, "location": <int>, "red_flags": <int>}\n'
+        "}"
     )
 
     response = _chat_completion(
@@ -214,87 +239,30 @@ def quick_score(job: dict, profile: dict) -> tuple[int, dict]:
     )
     result = json.loads(response.choices[0].message.content)
 
+    # ── Extract text fields ──
+    job["match_summary"] = result.get("match_summary", "")
+    job["red_flags"] = result.get("red_flags", [])
+
     # ── Server-side recomputation (don't trust LLM arithmetic) ──
     b1 = result.get("block1", {})
     b2 = result.get("block2", {})
-    computed = (
-        min(max(b1.get("domain", 0), 0), _CAPS["domain"])
-        + min(max(b1.get("patterns", 0), 0), _CAPS["patterns"])
-        + min(max(b1.get("role", 0), 0), _CAPS["role"])
-        + min(max(b2.get("tools", 0), 0), _CAPS["tools"])
-        + min(max(b2.get("experience", 0), 0), _CAPS["experience"])
-        + min(max(b2.get("location", 0), 0), _CAPS["location"])
-        + min(max(b2.get("red_flags", 0), 0), _CAPS["red_flags"])
-    )
 
-    breakdown = {"block1": dict(b1), "block2": dict(b2)}
-    return computed, breakdown
+    # Clamp sub-scores to valid ranges
+    b1 = {k: min(max(b1.get(k, 0), 0), _CAPS[k]) for k in ("domain", "patterns", "role")}
+    b2 = {k: min(max(b2.get(k, 0), 0), _CAPS[k]) for k in ("tools", "experience", "location", "red_flags")}
 
+    computed = sum(b1.values()) + sum(b2.values())
 
-def score_job(job: dict, profile: dict) -> dict:
-    """
-    Enrichment-only analysis for jobs that already passed quick_score threshold.
-    Adds match_summary and red_flags. Does NOT override score — quick_score is authoritative.
-    """
-    job_text = (
-        f"Title: {job.get('title', 'N/A')}\n"
-        f"Company: {job.get('company', 'N/A')}\n"
-        f"Location/Remote: {job.get('location', 'N/A')}\n"
-        f"Salary: {job.get('salary', 'Not listed')}\n"
-        f"Description:\n{job.get('description', '')[:4000]}"
-    )
-
-    profile_text = json.dumps(profile, indent=2)
-
-    # Custom dealbreakers from profile
-    dealbreakers = profile.get("custom_red_flags") or []
-    dealbreakers_section = ""
-    if dealbreakers:
-        items = "\n".join(f"- {d}" for d in dealbreakers)
-        dealbreakers_section = (
-            f"\n\nYOUR DEALBREAKERS (flag in red_flags if any apply):\n{items}"
-        )
-
-    response = _chat_completion(
-        model="gpt-4.1-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are writing a short job evaluation directly TO the candidate (use 'you/your', "
-                    "never third person like 'the candidate' or 'Igor').\n\n"
-                    "CRITICAL RULES:\n"
-                    "- Use ONLY facts explicitly stated in the candidate profile. "
-                    "Do NOT infer, assume, or invent any details.\n"
-                    "- If something is not mentioned in the profile, treat it as absent.\n"
-                    "- Address the candidate directly: 'This role fits you because...' or "
-                    "'You lack the required...'\n\n"
-                    "Return a JSON object with:\n"
-                    "- match_summary: string (1-2 sentences explaining why this job does or doesn't "
-                    "fit YOU, focused on the job's requirements vs your profile)\n"
-                    "- red_flags: list of strings — ONLY genuine concerns, mismatches, or dealbreakers. "
-                    "Include as many or as few as actually exist. Do NOT pad to a fixed number. "
-                    "If there are zero real concerns, return an empty list. "
-                    "Do NOT duplicate the same concern in different words.\n\n"
-                    "Return only valid JSON."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"CANDIDATE PROFILE:\n{profile_text}\n\n"
-                    f"JOB POSTING:\n{job_text}{dealbreakers_section}"
-                ),
-            },
-        ],
-    )
-
-    result = json.loads(response.choices[0].message.content)
-    # Do NOT override job["score"] — quick_score is the authoritative score
-    job["match_summary"] = result.get("match_summary", "")
-    job["red_flags"] = result.get("red_flags", [])
+    job["score"] = computed
+    job["score_breakdown"] = {"block1": dict(b1), "block2": dict(b2)}
     return job
+
+
+# Keep quick_score as a thin wrapper for backward compatibility with process_jobs.py
+def quick_score(job: dict, profile: dict) -> tuple[int, dict]:
+    """Score a job and return (score, breakdown). Also sets match_summary/red_flags on the job dict."""
+    enriched = score_job(job, profile)
+    return enriched["score"], enriched["score_breakdown"]
 
 
 if __name__ == "__main__":

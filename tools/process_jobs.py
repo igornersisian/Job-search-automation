@@ -33,7 +33,7 @@ from run_indeed_search import run_search as run_indeed_search
 from run_wellfound_search import run_search as run_wellfound_search
 from run_remoteboards_search import run_search as run_remoteboards_search
 from run_ats_search import run_search as run_ats_search
-from score_job import score_job, quick_score, is_excluded_by_title
+from score_job import quick_score, is_excluded_by_title
 from notify_telegram import send_job_card, send_daily_summary, send_message
 
 load_dotenv()
@@ -263,31 +263,23 @@ def _fetch_all_sources(keywords: list[str], profile: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _process_single_job(job: dict, profile: dict, threshold: int) -> tuple[dict, str]:
-    """Score → enrich → send one job. Returns (job, status_label).
+    """Score + analyse + send one job. Returns (job, status_label).
 
+    Single LLM call: model writes match_summary + red_flags first (chain-of-thought),
+    then assigns sub-scores consistent with its analysis.
     Runs in a worker thread — no shared mutable state.
     """
-    # Quick score (cheap, authoritative)
     try:
         score, breakdown = quick_score(job, profile)
     except Exception as e:
         logger.error(f"Scoring failed for {job['title']}: {e}")
         return job, "score_error"
 
-    job["score"] = score
-    job["score_breakdown"] = breakdown
+    # quick_score now also sets match_summary + red_flags on the job dict
     logger.info(f"[{score}/100] {job['title']} @ {job['company']} ({job['source']})")
 
     if score < threshold:
         return job, "low_score"
-
-    # Enrich: match_summary + red_flags (no re-scoring)
-    try:
-        job = score_job(job, profile)
-    except Exception as e:
-        logger.error(f"Enrichment failed for {job['title']}: {e}")
-        job["match_summary"] = "(enrichment failed — see job listing)"
-        job["red_flags"] = []
 
     # Send to Telegram
     if send_job_card(job):
