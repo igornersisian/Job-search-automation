@@ -87,51 +87,121 @@ def is_excluded_by_title(job: dict, excluded_keywords: list[str]) -> bool:
     return any(kw in title for kw in excluded_keywords)
 
 
-def quick_score(job: dict, profile: dict) -> int:
-    """Fast score-only evaluation. Returns int 0-100.
+_EMPTY_BREAKDOWN = {
+    "block1": {"domain": 0, "patterns": 0, "role": 0},
+    "block2": {"tools": 0, "experience": 0, "location": 0, "red_flags": 0},
+}
 
-    Uses a compact prompt to minimise tokens — called for every job.
-    Only jobs that pass the threshold get a full score_job() call.
+# Sub-score caps for server-side clamping
+_CAPS = {
+    "domain": 25, "patterns": 20, "role": 15,
+    "tools": 15, "experience": 10, "location": 10, "red_flags": 5,
+}
+
+
+def quick_score(job: dict, profile: dict) -> tuple[int, dict]:
+    """Structured two-block score. Returns (int 0-100, breakdown dict).
+
+    Block 1 — Domain & Capability Fit (max 60):
+      domain (0-25), patterns (0-20), role (0-15)
+    Block 2 — Formal Requirements Fit (max 40):
+      tools (0-15), experience (0-10), location (0-10), red_flags (0-5)
+
+    Final score is recomputed server-side from sub-scores (LLM math not trusted).
     """
+    # ── Deterministic guard: empty / too-short description ──
+    description = (job.get("description") or "").strip()
+    if len(description) < 50:
+        logger.info(f"Empty/short description for '{job.get('title')}' — auto-score 0")
+        return 0, _EMPTY_BREAKDOWN
+
     job_text = (
         f"Title: {job.get('title', 'N/A')}\n"
         f"Company: {job.get('company', 'N/A')}\n"
-        f"Description:\n{job.get('description', '')[:4000]}"
+        f"Description:\n{description[:4000]}"
     )
     profile_text = json.dumps(profile, indent=2)
 
     # Custom dealbreakers from profile
     dealbreakers = profile.get("custom_red_flags") or []
 
-    # Build system prompt — dealbreakers go here for maximum weight
+    # ── Build system prompt — structured two-block scoring ──
     system_content = (
-        "Rate how well this candidate REALISTICALLY fits the job. "
-        "Use ONLY facts explicitly stated in the profile — do not infer, assume, or guess.\n\n"
+        "You are a job-candidate fit evaluator. "
+        "Score ONLY using facts explicitly stated in the candidate profile. "
+        "Do NOT infer, assume, or guess any skills, experience, or qualifications.\n\n"
     )
 
     if dealbreakers:
         items = "\n".join(f"- {d}" for d in dealbreakers)
         system_content += (
-            "DEALBREAKERS — HIGHEST PRIORITY:\n"
-            "If ANY of the following apply to this job, the score MUST be 25 or below. "
-            "No exceptions. Check these FIRST before evaluating anything else:\n"
+            "DEALBREAKERS — CHECK FIRST:\n"
+            "If ANY of these apply to this job, set ALL sub-scores to 0 "
+            "and total score to 0. No exceptions:\n"
             f"{items}\n\n"
         )
 
     system_content += (
-        "SCORING RULES:\n"
-        "- If the job requires N+ years of experience and the candidate has significantly less "
-        "(e.g. job asks 5+ years, candidate has <2), cap score at 40\n"
-        "- If the job requires specific programming languages or frameworks the candidate "
-        "doesn't demonstrate, deduct 15-20 points per critical missing skill\n"
-        "- If the job is senior/lead/staff level and candidate profile shows junior-level "
-        "experience, cap score at 45\n"
-        "- Score 70+ ONLY if the candidate could realistically compete for this role\n"
-        "- Score 90+ ONLY if the candidate meets virtually ALL stated requirements\n"
-        "- No-code/low-code experience does NOT count as software engineering experience "
-        "unless the job specifically asks for no-code skills\n"
-        "- When requirements are ambiguous, lean slightly lower rather than higher\n\n"
-        'Return JSON: {"score": <int 0-100>}'
+        "SCORING: Evaluate in TWO blocks. Total = Block1 + Block2 (max 100).\n\n"
+
+        "First, extract from the candidate profile:\n"
+        "- Their primary domain(s) (what field/industry they work in)\n"
+        "- Their approximate total years of professional experience\n"
+        "- Their seniority level (junior, mid, senior, lead, etc.)\n"
+        "- Their toolset and working style (what technologies they actually use)\n"
+        "Then compare against the job requirements.\n\n"
+
+        "BLOCK 1 — Domain & Capability Fit (max 60 points):\n"
+        "  domain (0-25): How well does the candidate's actual domain match the job's "
+        "domain? Be precise about domain boundaries — adjacent-sounding fields can be "
+        "very different in practice. For example: using AI APIs/integrations is different "
+        "from building/training ML models; front-end web dev is different from embedded "
+        "systems; DevOps is different from software architecture. "
+        "If the candidate works in a fundamentally different domain, score 0-5. "
+        "If related but not the same, score 8-15. If strong match, score 18-25.\n"
+        "  patterns (0-20): Does the candidate have experience with the architectural "
+        "patterns and categories of work the job needs? Use semantic matching — "
+        "similar patterns in different tools count partially. "
+        "Completely unrelated patterns score 0-3.\n"
+        "  role (0-15): Does the candidate's seniority match the job's level? "
+        "Compare the candidate's actual years of experience and role history against "
+        "the job's seniority expectations. "
+        "If the job is 3+ levels above the candidate (e.g. candidate is junior, "
+        "job is Director/VP/Head/Principal), cap at 2. "
+        "If the job is 2 levels above (e.g. candidate is junior, job is Senior/Staff), "
+        "cap at 5. If close match, score 10-15. "
+        "This also works in reverse: if the candidate is very senior and the job is "
+        "clearly junior, cap at 5 (overqualified).\n\n"
+
+        "BLOCK 2 — Formal Requirements Fit (max 40 points):\n"
+        "  tools (0-15): Does the candidate know the specific tools, languages, and "
+        "frameworks the job requires? Compare the candidate's ACTUAL toolset against "
+        "what's listed in the job. Similar/adjacent tools give partial credit (e.g. "
+        "React vs Vue = partial, Python vs Java = low). "
+        "If the candidate's entire approach to work is fundamentally different from "
+        "what the job requires (e.g. no-code vs traditional engineering, or vice versa), "
+        "score 0-3 unless the job explicitly values their approach.\n"
+        "  experience (0-10): Years of experience match. If the job states N+ years "
+        "required and the candidate has fewer, apply -5 per each missing year "
+        "(starting from 10, floor at 0). Example: job asks 5+, candidate has 1 → "
+        "4 years short → penalty -20 → capped at 0. "
+        "If the job does not mention years of experience, give 8.\n"
+        "  location (0-10): Does the candidate's location/remote preference match? "
+        "If the job requires office presence, specific country residence, security "
+        "clearance, or work visa that the candidate cannot meet, give 0. "
+        "If job is remote-friendly with no geographic restrictions, give 10.\n"
+        "  red_flags (0-5): 5 = no concerns from candidate's dealbreaker list. "
+        "Deduct for each red flag that applies. 0 = multiple serious concerns.\n\n"
+
+        "RULES:\n"
+        "- Be conservative: when uncertain, score lower rather than higher\n"
+        "- Score 70+ total ONLY if the candidate could realistically compete\n"
+        "- The final score MUST equal the sum of all 7 sub-scores\n\n"
+
+        "Return ONLY this JSON:\n"
+        '{"block1": {"domain": <int>, "patterns": <int>, "role": <int>}, '
+        '"block2": {"tools": <int>, "experience": <int>, "location": <int>, '
+        '"red_flags": <int>}, "score": <int>}'
     )
 
     response = _chat_completion(
@@ -143,7 +213,22 @@ def quick_score(job: dict, profile: dict) -> int:
         ],
     )
     result = json.loads(response.choices[0].message.content)
-    return result.get("score", 0)
+
+    # ── Server-side recomputation (don't trust LLM arithmetic) ──
+    b1 = result.get("block1", {})
+    b2 = result.get("block2", {})
+    computed = (
+        min(max(b1.get("domain", 0), 0), _CAPS["domain"])
+        + min(max(b1.get("patterns", 0), 0), _CAPS["patterns"])
+        + min(max(b1.get("role", 0), 0), _CAPS["role"])
+        + min(max(b2.get("tools", 0), 0), _CAPS["tools"])
+        + min(max(b2.get("experience", 0), 0), _CAPS["experience"])
+        + min(max(b2.get("location", 0), 0), _CAPS["location"])
+        + min(max(b2.get("red_flags", 0), 0), _CAPS["red_flags"])
+    )
+
+    breakdown = {"block1": dict(b1), "block2": dict(b2)}
+    return computed, breakdown
 
 
 def score_job(job: dict, profile: dict) -> dict:

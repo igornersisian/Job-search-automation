@@ -186,6 +186,7 @@ def save_job(job: dict, status: str) -> None:
         "score": job.get("score"),
         "match_summary": job.get("match_summary", ""),
         "red_flags": json.dumps(job.get("red_flags", [])),
+        "score_breakdown": json.dumps(job.get("score_breakdown", {})),
         "typical_qa": "[]",
         "status": status,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -259,12 +260,13 @@ def _process_single_job(job: dict, profile: dict, threshold: int) -> tuple[dict,
     """
     # Quick score (cheap, authoritative)
     try:
-        score = quick_score(job, profile)
+        score, breakdown = quick_score(job, profile)
     except Exception as e:
         logger.error(f"Scoring failed for {job['title']}: {e}")
         return job, "score_error"
 
     job["score"] = score
+    job["score_breakdown"] = breakdown
     logger.info(f"[{score}/100] {job['title']} @ {job['company']} ({job['source']})")
 
     if score < threshold:

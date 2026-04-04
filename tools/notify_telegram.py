@@ -69,6 +69,30 @@ def format_job_card(job: dict) -> str:
         f"💰 {salary}",
         f"🌍 Remote" + (f" • {source}" if source else ""),
         f"Score: {score}/100 {score_emoji}",
+    ]
+
+    breakdown = job.get("score_breakdown", {})
+    if breakdown:
+        b1 = breakdown.get("block1", {})
+        b2 = breakdown.get("block2", {})
+        if b1 or b2:
+            lines.append("")
+            lines.append("*Breakdown:*")
+            if b1:
+                lines.append(
+                    f"  Domain: {b1.get('domain', 0)}/25 | "
+                    f"Patterns: {b1.get('patterns', 0)}/20 | "
+                    f"Role: {b1.get('role', 0)}/15"
+                )
+            if b2:
+                lines.append(
+                    f"  Tools: {b2.get('tools', 0)}/15 | "
+                    f"YoE: {b2.get('experience', 0)}/10 | "
+                    f"Location: {b2.get('location', 0)}/10 | "
+                    f"Flags: {b2.get('red_flags', 0)}/5"
+                )
+
+    lines += [
         "",
         f"_{match_summary}_",
     ]

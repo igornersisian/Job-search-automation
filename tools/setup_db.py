@@ -41,10 +41,16 @@ CREATE TABLE IF NOT EXISTS jobs (
     score         INTEGER,
     match_summary TEXT,
     red_flags     TEXT,
+    score_breakdown TEXT,
     typical_qa    TEXT,
     status        TEXT,
     created_at    TIMESTAMPTZ DEFAULT NOW()
 );
+"""
+
+
+MIGRATE_SCORE_BREAKDOWN = """
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS score_breakdown TEXT;
 """
 
 
@@ -62,6 +68,7 @@ def ensure_tables() -> None:
         with conn.cursor() as cur:
             cur.execute(CREATE_PROFILE)
             cur.execute(CREATE_JOBS)
+            cur.execute(MIGRATE_SCORE_BREAKDOWN)
         conn.close()
         logger.info("Database tables verified/created")
     except Exception as e:
