@@ -148,7 +148,7 @@ def save_profile(raw_text: str, parsed: dict) -> None:
     """
     existing = get_profile()
     if existing:
-        for key in ("search_keywords", "custom_red_flags", "score_threshold", "excluded_title_keywords"):
+        for key in ("search_keywords", "custom_red_flags", "score_threshold", "excluded_title_keywords", "wellfound_roles"):
             if key in existing:
                 parsed[key] = existing[key]
     get_supabase().table("profile").upsert({
@@ -174,6 +174,45 @@ def save_search_keywords(keywords: list[str]) -> None:
         logger.error("No profile found — upload resume first")
         return
     profile["search_keywords"] = keywords
+    get_supabase().table("profile").update({
+        "parsed": profile,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", 1).execute()
+
+
+WELLFOUND_VALID_ROLES = [
+    "Software Engineer", "Mobile Developer", "iOS Developer", "Android Developer",
+    "Frontend Engineer", "Backend Engineer", "Full-Stack Engineer", "Software Architect",
+    "Embedded Engineer", "Data Engineer", "Security Engineer", "Machine Learning Engineer",
+    "Engineering Manager", "QA Engineer", "DevOps", "Data Scientist",
+    "Designer", "User Researcher", "Visual Designer", "Creative Director",
+    "Graphic Designer", "Product Designer", "Design Manager",
+    "Product Manager",
+    "Operations", "Finance/Accounting", "H.R.", "Office Manager", "Recruiter",
+    "Customer Service", "Operations Manager", "Chief Of Staff",
+    "Sales", "Business Development", "Sales Development Representative",
+    "Account Executive", "BD Manager", "Account Manager", "Sales Manager",
+    "Customer Success Manager",
+    "Marketing", "Growth Hacker", "Marketing Manager",
+    "Digital Marketing Manager", "Product Marketing Manager",
+]
+
+
+def get_wellfound_roles() -> list[str] | None:
+    """Return Wellfound role filters from profile, or None if not set."""
+    profile = get_profile()
+    if profile:
+        return profile.get("wellfound_roles")
+    return None
+
+
+def save_wellfound_roles(roles: list[str]) -> None:
+    """Save Wellfound roles into the profile's parsed JSONB."""
+    profile = get_profile()
+    if not profile:
+        logger.error("No profile found — upload resume first")
+        return
+    profile["wellfound_roles"] = roles
     get_supabase().table("profile").update({
         "parsed": profile,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -378,6 +417,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/help — this message\n"
         "/status — show your current profile summary\n"
         "/keywords — set search keywords (comma-separated)\n"
+        "/wellfound — set Wellfound role filters (separate from keywords)\n"
         "/threshold — set minimum score % to send (default 70)\n"
         "/redflags — set dealbreakers (e.g. requires US work permit)\n"
         "/excluded — set title keywords to skip (e.g. intern, trainee)\n"
@@ -445,6 +485,55 @@ async def cmd_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     save_search_keywords(keywords)
     await update.message.reply_text(
         f"Search keywords saved ({len(keywords)}):\n" + ", ".join(keywords)
+    )
+
+
+async def cmd_wellfound(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set or show Wellfound role filters."""
+    if not context.args:
+        roles = get_wellfound_roles()
+        roles_list = "\n".join(f"• {r}" for r in WELLFOUND_VALID_ROLES)
+        if roles:
+            current = ", ".join(roles)
+            await update.message.reply_text(
+                f"*Current Wellfound roles:*\n{current}\n\n"
+                f"*Available roles:*\n{roles_list}\n\n"
+                "To change: /wellfound Software Engineer, DevOps, Data Scientist\n"
+                "To clear: /wellfound clear",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                "⚠️ No Wellfound roles set — Wellfound search is skipped.\n\n"
+                f"*Available roles:*\n{roles_list}\n\n"
+                "Set roles: /wellfound Software Engineer, DevOps, Data Scientist",
+                parse_mode="Markdown",
+            )
+        return
+
+    raw_text = " ".join(context.args)
+    if raw_text.strip().lower() == "clear":
+        save_wellfound_roles([])
+        await update.message.reply_text("Wellfound roles cleared. Wellfound search will be skipped.")
+        return
+
+    roles = [r.strip() for r in raw_text.split(",") if r.strip()]
+    if not roles:
+        await update.message.reply_text("Send roles separated by commas: /wellfound Software Engineer, DevOps")
+        return
+
+    # Validate against known roles
+    invalid = [r for r in roles if r not in WELLFOUND_VALID_ROLES]
+    if invalid:
+        await update.message.reply_text(
+            f"⚠️ Unknown roles: {', '.join(invalid)}\n\n"
+            "Use /wellfound without arguments to see the full list."
+        )
+        return
+
+    save_wellfound_roles(roles)
+    await update.message.reply_text(
+        f"Wellfound roles saved ({len(roles)}):\n" + ", ".join(roles)
     )
 
 
@@ -817,6 +906,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("keywords", cmd_keywords))
+    app.add_handler(CommandHandler("wellfound", cmd_wellfound))
     app.add_handler(CommandHandler("threshold", cmd_threshold))
     app.add_handler(CommandHandler("redflags", cmd_redflags))
     app.add_handler(CommandHandler("excluded", cmd_excluded))

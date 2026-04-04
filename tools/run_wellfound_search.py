@@ -4,8 +4,9 @@ Trigger Apify Wellfound (AngelList) Scraper and return job list.
 Actor: clearpath/wellfound-api-ppe
 Docs:  https://apify.com/clearpath/wellfound-api-ppe
 
-This actor takes Wellfound URLs (not keywords).  We convert search_keywords
-into role-slug URLs like https://wellfound.com/role/r/automation-engineer.
+This actor takes Wellfound URLs (not keywords).  We convert wellfound_roles
+(set via /wellfound bot command) into role-slug URLs like
+https://wellfound.com/role/r/software-engineer.
 
 Usage:
     python tools/run_wellfound_search.py
@@ -36,37 +37,40 @@ def _get_token() -> str:
     return os.environ["APIFY_API_TOKEN"]
 
 
-def _keyword_to_slug(keyword: str) -> str:
-    """Convert a search keyword to a Wellfound role slug.
+def _role_to_slug(role: str) -> str:
+    """Convert a Wellfound role name to a URL slug.
 
-    'AI automation engineer' → 'ai-automation-engineer'
+    'Software Engineer' → 'software-engineer'
+    'H.R.' → 'hr'
+    'Finance/Accounting' → 'finance-accounting'
     """
-    slug = keyword.lower().strip()
+    slug = role.lower().strip()
     slug = re.sub(r"[^a-z0-9\s-]", "", slug)
     slug = re.sub(r"\s+", "-", slug)
-    return slug
+    slug = re.sub(r"-+", "-", slug)
+    return slug.strip("-")
 
 
-def _build_urls(keywords: list[str]) -> list[str]:
-    """Build Wellfound search URLs from keywords.
+def _build_urls(roles: list[str]) -> list[str]:
+    """Build Wellfound search URLs from role names.
 
-    Converts each keyword into a role slug URL.
-    Deduplicates slugs (e.g. 'backend engineer' and 'Backend Engineer' → one URL).
+    Uses validated role names from the /wellfound bot command.
+    Deduplicates slugs.
     """
     seen: set[str] = set()
     urls: list[str] = []
-    for kw in keywords:
-        slug = _keyword_to_slug(kw)
+    for role in roles:
+        slug = _role_to_slug(role)
         if slug and slug not in seen:
             seen.add(slug)
             urls.append(f"https://wellfound.com/role/r/{slug}")
     return urls
 
 
-def run_actor(keywords: list[str]) -> str:
+def run_actor(roles: list[str]) -> str:
     url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
     params = {"token": _get_token()}
-    search_urls = _build_urls(keywords)
+    search_urls = _build_urls(roles)
 
     actor_input = {
         "urls": search_urls,
@@ -181,17 +185,25 @@ def normalise_wellfound(raw: dict) -> dict:
 def run_search(keywords: list[str], profile: dict | None = None) -> list[dict]:
     """Full flow: trigger → wait → fetch → normalise.
 
-    Converts keywords to Wellfound role-slug URLs.
-    profile arg kept for interface consistency but no longer used for URLs.
+    Uses wellfound_roles from profile (set via /wellfound bot command).
+    Falls back to empty list if no roles configured — skips Wellfound entirely.
+    keywords arg is ignored (kept for interface consistency with other scrapers).
     """
-    run_id = run_actor(keywords)
+    roles = (profile or {}).get("wellfound_roles") or []
+    if not roles:
+        logger.info("No Wellfound roles configured — skipping Wellfound search. Use /wellfound in bot to set roles.")
+        return []
+
+    logger.info(f"Wellfound roles ({len(roles)}): {roles}")
+    run_id = run_actor(roles)
     dataset_id = wait_for_run(run_id)
     raw_items = fetch_dataset(dataset_id)
     return [normalise_wellfound(item) for item in raw_items]
 
 
 if __name__ == "__main__":
-    test_keywords = ["software engineer", "automation engineer"]
-    jobs = run_search(test_keywords)
+    test_roles = ["Software Engineer", "Data Scientist"]
+    # Simulate profile with wellfound_roles for standalone testing
+    jobs = run_search([], {"wellfound_roles": test_roles})
     print(json.dumps(jobs, ensure_ascii=False, indent=2))
     logger.info(f"Done. {len(jobs)} Wellfound jobs fetched.")
