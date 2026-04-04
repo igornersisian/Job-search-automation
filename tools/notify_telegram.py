@@ -80,17 +80,19 @@ def format_job_card(job: dict) -> str:
             lines.append("*Breakdown:*")
             if b1:
                 lines.append(
-                    f"  Domain: {b1.get('domain', 0)}/25 | "
-                    f"Patterns: {b1.get('patterns', 0)}/20 | "
+                    f"  Domain: {b1.get('domain', 0)}/30 | "
+                    f"Patterns: {b1.get('patterns', 0)}/25 | "
                     f"Role: {b1.get('role', 0)}/15"
                 )
             if b2:
                 lines.append(
-                    f"  Tools: {b2.get('tools', 0)}/15 | "
-                    f"YoE: {b2.get('experience', 0)}/10 | "
-                    f"Location: {b2.get('location', 0)}/10 | "
-                    f"Flags: {b2.get('red_flags', 0)}/5"
+                    f"  Tools: {b2.get('tools', 0)}/20 | "
+                    f"YoE: {b2.get('experience', 0)}/10"
                 )
+            penalty = breakdown.get("penalty", 0)
+            if penalty:
+                count = breakdown.get("red_flag_count", 0)
+                lines.append(f"  Red flags: {count} x (-15) = -{penalty}")
 
     lines += [
         "",

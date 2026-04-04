@@ -90,14 +90,19 @@ def is_excluded_by_title(job: dict, excluded_keywords: list[str]) -> bool:
 
 _EMPTY_BREAKDOWN = {
     "block1": {"domain": 0, "patterns": 0, "role": 0},
-    "block2": {"tools": 0, "experience": 0, "location": 0, "red_flags": 0},
+    "block2": {"tools": 0, "experience": 0},
+    "penalty": 0,
+    "red_flag_count": 0,
 }
 
-# Sub-score caps for server-side clamping
+# Sub-score caps for server-side clamping (total base max = 100)
 _CAPS = {
-    "domain": 25, "patterns": 20, "role": 15,
-    "tools": 15, "experience": 10, "location": 10, "red_flags": 5,
+    "domain": 30, "patterns": 25, "role": 15,
+    "tools": 20, "experience": 10,
 }
+
+# Each red flag deducts this many points from the base score
+RED_FLAG_PENALTY = 15
 
 
 def score_job(job: dict, profile: dict) -> dict:
@@ -131,7 +136,7 @@ def score_job(job: dict, profile: dict) -> dict:
 
     # ── Build system prompt ──
     system_content = (
-        "You are a job-candidate fit evaluator. "
+        "You are a strict job-candidate fit evaluator. "
         "Score ONLY using facts explicitly stated in the candidate profile. "
         "Do NOT infer, assume, or guess any skills, experience, or qualifications.\n\n"
     )
@@ -140,8 +145,8 @@ def score_job(job: dict, profile: dict) -> dict:
         items = "\n".join(f"- {d}" for d in dealbreakers)
         system_content += (
             "DEALBREAKERS — CHECK FIRST:\n"
-            "If ANY of these apply to this job, set ALL sub-scores to 0 "
-            "and total score to 0. No exceptions:\n"
+            "If ANY of these apply to this job, set ALL sub-scores to 0. "
+            "No exceptions:\n"
             f"{items}\n\n"
         )
 
@@ -154,78 +159,83 @@ def score_job(job: dict, profile: dict) -> dict:
         "Mention the most important match or mismatch.\n\n"
 
         "STEP 2: List red_flags.\n"
-        "Every genuine concern, mismatch, or dealbreaker. "
-        "Include as many or as few as actually exist. "
-        "If zero real concerns, return an empty list. "
+        "CRITICAL: Red flags are the most important part of your evaluation. "
+        "Each red flag will deduct 15 points from the final score. "
+        "Be thorough — missing a real red flag means the candidate wastes time "
+        "on a job they can't get.\n\n"
+
+        "You MUST flag ALL of the following if they apply:\n"
+        "- Location mismatch: if the job description mentions hybrid, in-office, "
+        "on-site, specific office days, or requires physical presence — flag it "
+        "REGARDLESS of what the job title or metadata says. Read the FULL description.\n"
+        "- Unpaid/volunteer/bootcamp: if the job is unpaid, this violates any "
+        "minimum salary dealbreaker. '$0/hr < $25/hr' — flag it.\n"
+        "- Seniority mismatch: if the job title includes Senior/Staff/Principal/"
+        "Director/VP/Head/Lead/Founding and the candidate lacks the years of "
+        "experience for that level — flag it.\n"
+        "- Domain mismatch: if the job requires traditional software engineering "
+        "(writing production code in React/Node/Python/Go/Java etc.) but the "
+        "candidate uses AI-assisted development and no-code/low-code tools — "
+        "flag 'requires traditional software engineering'.\n"
+        "- Tool mismatch: if the job lists specific languages/frameworks the "
+        "candidate does not know and cannot substitute — flag it.\n"
+        "- Any dealbreaker from the list above that applies.\n\n"
+
+        "If zero real concerns exist, return an empty list. "
         "Do NOT duplicate the same concern in different words.\n\n"
 
         "STEP 3: Assign sub-scores.\n"
         "Your scores MUST be consistent with your match_summary and red_flags above. "
-        "If you wrote that something is a problem, the corresponding score must be LOW. "
-        "If you flagged 'hybrid' as a red flag, location must be 0-2. "
-        "If you flagged seniority mismatch, role must reflect that.\n\n"
+        "If you identified a problem in Steps 1-2, the corresponding score MUST be LOW.\n\n"
 
-        "SUB-SCORES:\n\n"
+        "SUB-SCORES (5 dimensions, max 100 base points):\n\n"
 
-        "BLOCK 1 — Domain & Capability Fit (max 60 points):\n"
-        "  domain (0-25): How well does the candidate's actual domain match the job's "
-        "domain? Be precise about domain boundaries — adjacent-sounding fields can be "
-        "very different in practice. For example: using AI APIs/integrations is different "
-        "from building/training ML models; front-end web dev is different from embedded "
-        "systems; DevOps is different from software architecture; "
-        "product management is different from engineering. "
-        "If the candidate works in a fundamentally different domain, score 0-5. "
-        "If related but not the same, score 8-15. If strong match, score 18-25.\n"
-        "  patterns (0-20): Does the candidate have experience with the architectural "
-        "patterns and categories of work the job needs? Use semantic matching — "
-        "similar patterns in different tools count partially. "
+        "BLOCK 1 — Domain & Capability Fit (max 70 points):\n"
+        "  domain (0-30): How well does the candidate's actual domain match the job's "
+        "domain? Be precise — adjacent-sounding fields can be very different. "
+        "Using AI APIs/integrations ≠ building/training ML models. "
+        "AI-assisted development (vibe coding) ≠ traditional software engineering. "
+        "Product management ≠ engineering. Sales enablement ≠ product engineering. "
+        "If fundamentally different domain, score 0-5. "
+        "If related but not the same, score 8-15. If strong match, score 20-30.\n"
+        "  patterns (0-25): Does the candidate have experience with the architectural "
+        "patterns the job needs? Use semantic matching — similar patterns in different "
+        "tools count partially. If the job requires writing production code from scratch "
+        "but the candidate builds with no-code/low-code + AI assistance, score 0-5. "
         "Completely unrelated patterns score 0-3.\n"
-        "  role (0-15): Does the candidate's seniority match the job's level? "
-        "Compare the candidate's actual years of experience and role history against "
-        "the job's seniority expectations. "
-        "If the job is 3+ levels above the candidate (e.g. candidate is junior, "
-        "job is Director/VP/Head/Principal), cap at 2. "
-        "If the job is 2 levels above (e.g. candidate is junior, job is Senior/Staff), "
-        "cap at 5. If close match, score 10-15. "
-        "This also works in reverse: if the candidate is very senior and the job is "
-        "clearly junior, cap at 5 (overqualified).\n\n"
+        "  role (0-15): Does the candidate's seniority match? "
+        "Compare actual years of experience against the job's level. "
+        "If the job is 3+ levels above (Junior → Director/VP/Head/Principal), cap at 2. "
+        "If 2 levels above (Junior → Senior/Staff), cap at 5. "
+        "If close match, score 10-15.\n\n"
 
-        "BLOCK 2 — Formal Requirements Fit (max 40 points):\n"
-        "  tools (0-15): Does the candidate know the specific tools, languages, and "
-        "frameworks the job requires? Compare the candidate's ACTUAL toolset against "
-        "what's listed in the job. Similar/adjacent tools give partial credit (e.g. "
-        "React vs Vue = partial, Python vs Java = low). "
-        "If the candidate's entire approach to work is fundamentally different from "
-        "what the job requires (e.g. no-code vs traditional engineering, or vice versa), "
-        "score 0-3 unless the job explicitly values their approach.\n"
+        "BLOCK 2 — Formal Requirements (max 30 points):\n"
+        "  tools (0-20): Does the candidate know the specific tools/languages/frameworks? "
+        "Compare ACTUAL toolset. Similar tools = partial credit. "
+        "If the candidate's approach is fundamentally different (no-code vs traditional "
+        "engineering), score 0-3 unless the job explicitly values their approach.\n"
         "  experience (0-10): Years of experience match. If the job states N+ years "
-        "required and the candidate has fewer, apply -5 per each missing year "
-        "(starting from 10, floor at 0). Example: job asks 5+, candidate has 1 → "
-        "4 years short → penalty -20 → capped at 0. "
-        "If the job does not mention years of experience, give 8.\n"
-        "  location (0-10): Does the candidate's location/remote preference match? "
-        "If the job is hybrid, on-site, office-based, or requires specific country "
-        "residence/clearance/visa that the candidate cannot meet, give 0. "
-        "If job is fully remote with no geographic restrictions, give 10.\n"
-        "  red_flags (0-5): 5 = no concerns. "
-        "Deduct 1 for each red flag you listed above. 0 = multiple serious concerns.\n\n"
+        "and the candidate has fewer, apply -5 per missing year (starting from 10, "
+        "floor 0). If no YOE mentioned, give 8.\n\n"
 
         "CONSISTENCY RULE:\n"
-        "Before returning, re-read your match_summary and red_flags. "
-        "If you described a serious mismatch but gave a high score for that dimension, "
-        "FIX THE SCORE to match your analysis. Your text analysis is the truth — "
-        "the numbers must follow it, not the other way around.\n\n"
+        "Before returning, re-read your red_flags. For EACH red flag, verify that "
+        "the corresponding sub-score is LOW (0-5). If you flagged domain mismatch "
+        "but domain > 5, FIX IT. If you flagged seniority mismatch but role > 5, "
+        "FIX IT. Your text analysis is the truth.\n\n"
 
-        "RULES:\n"
-        "- Be conservative: when uncertain, score lower rather than higher\n"
-        "- Score 70+ total ONLY if the candidate could realistically compete\n\n"
+        "SCORING: The base score = sum of all sub-scores (max 100). "
+        "Then each red flag you listed deducts 15 points. "
+        "So if you list 3 red flags, the candidate loses 45 points. "
+        "This means red flags have MASSIVE impact — only flag genuine concerns, "
+        "but flag ALL genuine concerns.\n\n"
 
         "Return ONLY this JSON (match_summary and red_flags FIRST, then scores):\n"
         "{\n"
         '  "match_summary": "<1-2 sentences>",\n'
         '  "red_flags": ["<flag1>", ...],\n'
         '  "block1": {"domain": <int>, "patterns": <int>, "role": <int>},\n'
-        '  "block2": {"tools": <int>, "experience": <int>, "location": <int>, "red_flags": <int>}\n'
+        '  "block2": {"tools": <int>, "experience": <int>}\n'
         "}"
     )
 
@@ -249,12 +259,19 @@ def score_job(job: dict, profile: dict) -> dict:
 
     # Clamp sub-scores to valid ranges
     b1 = {k: min(max(b1.get(k, 0), 0), _CAPS[k]) for k in ("domain", "patterns", "role")}
-    b2 = {k: min(max(b2.get(k, 0), 0), _CAPS[k]) for k in ("tools", "experience", "location", "red_flags")}
+    b2 = {k: min(max(b2.get(k, 0), 0), _CAPS[k]) for k in ("tools", "experience")}
 
-    computed = sum(b1.values()) + sum(b2.values())
+    base = sum(b1.values()) + sum(b2.values())
+    penalty = len(job["red_flags"]) * RED_FLAG_PENALTY
+    computed = max(base - penalty, 0)
 
     job["score"] = computed
-    job["score_breakdown"] = {"block1": dict(b1), "block2": dict(b2)}
+    job["score_breakdown"] = {
+        "block1": dict(b1),
+        "block2": dict(b2),
+        "penalty": penalty,
+        "red_flag_count": len(job["red_flags"]),
+    }
     return job
 
 
