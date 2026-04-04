@@ -1,4 +1,4 @@
-# Job Application Automation
+# Job Search Automation
 
 A self-hosted job search assistant that scrapes 20+ job platforms daily, scores listings against your resume with AI, and delivers the best matches to your Telegram.
 
