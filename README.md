@@ -5,8 +5,8 @@ A self-hosted job search assistant that scrapes 20+ job platforms daily, scores 
 ## How it works
 
 1. **Send your resume PDF** to the Telegram bot — it parses it with OpenAI and stores a structured profile in Supabase.
-2. **Every weekday at 9:00 UTC**, a cron job fetches remote jobs from 6 sources (20+ platforms) in parallel, deduplicates, scores each one against your profile, and sends high-scoring cards to Telegram.
-3. **In the bot**, you can ask follow-up questions, analyze any job URL with `/job <url>`, tune scoring with `/threshold` and `/redflags`, or get cover letter help.
+2. **Every weekday at 9:00 UTC**, the bot fetches remote jobs from 6 sources (20+ platforms) in parallel, deduplicates, scores each one against your profile, and sends high-scoring cards to Telegram.
+3. **In the bot**, you can ask follow-up questions, analyze any job URL with `/job <url>`, tune scoring with `/threshold` and `/redflags`, configure search keywords, or get cover letter help.
 
 ## Sources
 
@@ -25,21 +25,21 @@ All scrapers run in parallel via Apify:
 
 ```
 tools/
-  telegram_bot.py          — Telegram interface (resume upload, /job, /threshold, /redflags, /stats)
-  process_jobs.py          — Daily pipeline orchestrator (fetch → dedup → score → notify)
-  run_apify_search.py      — LinkedIn scraper
-  run_glassdoor_search.py  — Glassdoor scraper
-  run_indeed_search.py     — Indeed scraper
-  run_wellfound_search.py  — Wellfound scraper
+  telegram_bot.py            — Telegram interface + built-in scheduler (no separate cron container)
+  process_jobs.py            — Daily pipeline orchestrator (fetch → dedup → score → notify)
+  run_apify_search.py        — LinkedIn scraper
+  run_glassdoor_search.py    — Glassdoor scraper
+  run_indeed_search.py       — Indeed scraper
+  run_wellfound_search.py    — Wellfound scraper
   run_remoteboards_search.py — RemoteOK + Remotive + WeWorkRemotely (JobsFlow)
-  run_ats_search.py        — 13 ATS platforms (Greenhouse, Lever, Workday, etc.)
-  score_job.py             — OpenAI scoring + enrichment
-  notify_telegram.py       — Telegram job card sender
-  setup_db.py              — Auto-create Supabase tables on startup
+  run_ats_search.py          — 13 ATS platforms (Greenhouse, Lever, Workday, etc.)
+  score_job.py               — OpenAI scoring + enrichment (OpenRouter fallback)
+  notify_telegram.py         — Telegram job card sender
+  setup_db.py                — Auto-create Supabase tables on startup
 
 workflows/
-  daily_job_search.md      — Detailed pipeline SOP
-  telegram_bot_usage.md    — Bot command reference
+  daily_job_search.md        — Detailed pipeline SOP
+  telegram_bot_usage.md      — Bot command reference
 ```
 
 ## Pipeline flow
@@ -51,9 +51,9 @@ Normalise to shared schema
     ↓
 Dedup: cross-run (Supabase) → same-run (ID) → fuzzy (title+company+description)
     ↓
-Junior/intern filter
+Junior/intern + excluded-title filter
     ↓
-Quick score (OpenAI, 0-100)
+Quick score (OpenAI, 0-100; OpenRouter fallback)
     ↓
 Score >= threshold? → Enrich (match_summary, red_flags) → Telegram card
     ↓
@@ -62,13 +62,13 @@ Daily summary → Telegram
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.12+
 - Docker (for deployment)
 - Accounts: OpenAI, Telegram bot, Supabase (or self-hosted), Apify
 
 ## Environment variables
 
-Create a `.env` file (see `.env.example`):
+Create a `.env` file with the following variables:
 
 | Variable | Description |
 |---|---|
@@ -105,7 +105,7 @@ python tools/telegram_bot.py
 3. In **Environment** tab, add all variables from the table above.
 4. Click **Deploy**.
 
-The `bot` service starts long-polling immediately. The `cron` service runs `process_jobs.py` every weekday at 9:00 UTC.
+The bot starts long-polling immediately. The daily pipeline runs on a built-in scheduler (weekdays at 9:00 UTC) — no separate cron container needed.
 
 ## Bot commands
 
@@ -114,8 +114,12 @@ The `bot` service starts long-polling immediately. The `cron` service runs `proc
 | Send PDF | Upload resume to set up profile |
 | `/status` | Check current profile |
 | `/job <url>` | Analyze any job listing |
+| `/fetch` | Manually trigger the job search pipeline |
 | `/threshold <N>` | Set minimum score (default 70) |
+| `/keywords` | Set or view search keywords |
+| `/wellfound` | Configure Wellfound role filters |
 | `/redflags` | Configure personal dealbreakers |
+| `/excluded` | Set title keywords to skip (e.g. "intern", "senior") |
 | `/stats` | View pipeline statistics |
 | Free text | Chat about jobs, get cover letter help |
 
