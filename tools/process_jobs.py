@@ -173,7 +173,7 @@ def fetch_existing_ids(job_ids: list[str]) -> set[str]:
 
 def save_job(job: dict, status: str) -> None:
     """Insert job record into Supabase."""
-    get_supabase().table("jobs").upsert({
+    row = {
         "id": job.get("id") or job.get("jobId") or job.get("url", "")[:200],
         "source": job.get("source", "linkedin"),
         "title": job.get("title", ""),
@@ -190,7 +190,16 @@ def save_job(job: dict, status: str) -> None:
         "typical_qa": "[]",
         "status": status,
         "created_at": datetime.now(timezone.utc).isoformat(),
-    }).execute()
+    }
+    try:
+        get_supabase().table("jobs").upsert(row).execute()
+    except Exception as e:
+        if "score_breakdown" in str(e):
+            logger.warning("score_breakdown column missing — saving without it")
+            row.pop("score_breakdown", None)
+            get_supabase().table("jobs").upsert(row).execute()
+        else:
+            raise
 
 
 # ---------------------------------------------------------------------------
