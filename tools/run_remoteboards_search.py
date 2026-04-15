@@ -110,7 +110,7 @@ def normalise_remoteboards(raw: dict) -> dict:
         "company": raw.get("company", ""),
         "url": raw.get("url", ""),
         "salary": raw.get("salary", ""),
-        "description": (raw.get("description") or "")[:5000],
+        "description": raw.get("description") or "",
         "location": raw.get("location", ""),
         "postedAt": raw.get("posted_at"),
         "is_remote": True,

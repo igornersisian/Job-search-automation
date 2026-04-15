@@ -121,7 +121,7 @@ def normalise_indeed(raw: dict) -> dict:
         "company": (raw.get("employer") or {}).get("name", ""),
         "url": job_url,
         "salary": salary_text,
-        "description": description[:5000],
+        "description": description,
         "location": location_str,
         "postedAt": raw.get("datePublished"),
         "is_remote": False,  # Indeed doesn't have a dedicated remote flag

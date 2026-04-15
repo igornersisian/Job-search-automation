@@ -174,7 +174,7 @@ def normalise_wellfound(raw: dict) -> dict:
         "company": raw.get("company_name", ""),
         "url": job_url,
         "salary": salary_text,
-        "description": (raw.get("description") or "")[:5000],
+        "description": raw.get("description") or "",
         "location": location_str,
         "postedAt": posted_at,
         "is_remote": raw.get("remote", False),

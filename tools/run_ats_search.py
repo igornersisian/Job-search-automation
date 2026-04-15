@@ -144,7 +144,7 @@ def normalise_ats(raw: dict) -> dict:
         "company": company_name,
         "url": raw.get("listing_url") or raw.get("apply_url", ""),
         "salary": salary_text,
-        "description": (raw.get("description") or "")[:5000],
+        "description": raw.get("description") or "",
         "location": location_str,
         "postedAt": raw.get("date_posted"),
         "is_remote": raw.get("is_remote", False),

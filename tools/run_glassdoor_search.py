@@ -126,7 +126,7 @@ def normalise_glassdoor(raw: dict) -> dict:
         "company": employer.get("name", ""),
         "url": job_url,
         "salary": salary_text,
-        "description": (raw.get("description") or "")[:5000],
+        "description": raw.get("description") or "",
         "location": location_str,
         "postedAt": posted_at,
         "is_remote": False,
