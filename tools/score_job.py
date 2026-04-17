@@ -144,10 +144,25 @@ def score_job(job: dict, profile: dict) -> dict:
     if dealbreakers:
         items = "\n".join(f"- {d}" for d in dealbreakers)
         system_content += (
-            "DEALBREAKERS — CHECK FIRST:\n"
-            "If ANY of these apply to this job, set ALL sub-scores to 0. "
-            "No exceptions:\n"
+            "DEALBREAKERS (HARD BLOCKERS) — CHECK BEFORE ANYTHING ELSE:\n"
             f"{items}\n\n"
+            "How to apply them:\n"
+            "- Go through EACH dealbreaker one by one. For each, ask: does the job "
+            "description, ANYWHERE in its full text, match this dealbreaker in meaning?\n"
+            "- Match by MEANING, not by exact wording. The job will rarely use the "
+            "same phrasing as the dealbreaker. Translate terms from other languages, "
+            "convert units when needed, and resolve implicit signals against the "
+            "dealbreaker's intent.\n"
+            "- Read the FULL description. Do NOT rely on the 'Remote' tag, job "
+            "title, or any header metadata — the blocker is often only stated "
+            "deep in the description.\n"
+            "- When in doubt, flag it. Missing a real dealbreaker is worse than "
+            "over-flagging.\n\n"
+            "IF ANY DEALBREAKER MATCHES:\n"
+            "  1. Add it to red_flags, quoting the dealbreaker and the job phrase "
+            "that triggered it.\n"
+            "  2. Set ALL FIVE sub-scores to 0 (domain, patterns, role, tools, experience).\n"
+            "  3. Tech stack / tool match does NOT override a dealbreaker. No exceptions.\n\n"
         )
 
     system_content += (
@@ -244,10 +259,13 @@ def score_job(job: dict, profile: dict) -> dict:
         "floor 0). If no YOE mentioned, give 8.\n\n"
 
         "CONSISTENCY RULE:\n"
-        "Before returning, re-read your red_flags. For EACH red flag, verify that "
-        "the corresponding sub-score is LOW (0-5). If you flagged domain mismatch "
-        "but domain > 5, FIX IT. If you flagged seniority mismatch but role > 5, "
-        "FIX IT. Your text analysis is the truth.\n\n"
+        "Before returning, re-read your red_flags.\n"
+        "- If ANY red flag is a dealbreaker match, ALL FIVE sub-scores MUST be 0 "
+        "(domain, patterns, role, tools, experience). No partial credit.\n"
+        "- For non-dealbreaker red flags: the corresponding sub-score must be LOW "
+        "(0-5). If you flagged domain mismatch but domain > 5, FIX IT. If you "
+        "flagged seniority mismatch but role > 5, FIX IT.\n"
+        "Your text analysis is the truth.\n\n"
 
         "SCORING: The base score = sum of all sub-scores (max 100). "
         "Then each red flag you listed deducts 15 points. "
