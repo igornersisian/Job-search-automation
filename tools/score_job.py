@@ -8,6 +8,11 @@ Single-pass scoring with chain-of-thought:
   The model first writes match_summary + red_flags (forcing it to reason),
   then assigns sub-scores that must be consistent with its own analysis.
 
+Production path: gpt-5-mini + reasoning.effort=minimal + service_tier=flex
+via the Responses API. The full profile and all instructions live in the
+`instructions` field (stable prefix -> OpenAI prompt caching kicks in when
+scoring many jobs in a run).
+
 Usage (standalone):
     python tools/score_job.py '{"title": "...", "description": "..."}'
 """
@@ -32,6 +37,11 @@ logger = logging.getLogger(__name__)
 _openai_client: OpenAI | None = None
 _openrouter_client: OpenAI | None = None
 
+# Stable key so OpenAI routes repeated scoring calls to the same cache shard.
+# Bump this string whenever the instructions template changes — the cache
+# becomes useless the moment the prefix shifts by a single token.
+PROMPT_CACHE_KEY = "score_job_v1"
+
 
 def get_openai() -> OpenAI:
     global _openai_client
@@ -54,88 +64,165 @@ def _get_openrouter() -> OpenAI | None:
     return _openrouter_client
 
 
-def _chat_completion(messages: list, max_retries: int = 3, **kwargs):
-    """OpenAI call with retry on 429 + OpenRouter fallback."""
-    last_error = None
+def _is_reasoning_model(model: str) -> bool:
+    return model.startswith("gpt-5") or model.startswith("o")
+
+
+def _responses_call(
+    instructions: str,
+    user_input: str,
+    model: str,
+    reasoning_effort: str | None,
+    service_tier: str | None,
+):
+    kwargs: dict = {
+        "model": model,
+        "instructions": instructions,
+        "input": user_input,
+        "text": {"format": {"type": "json_object"}},
+        "prompt_cache_key": PROMPT_CACHE_KEY,
+        "store": False,
+    }
+    # gpt-5 / o-series reject `temperature` — they sample internally.
+    # Only pass it for non-reasoning models (e.g. gpt-4.1-mini).
+    if not _is_reasoning_model(model):
+        kwargs["temperature"] = 0
+    if reasoning_effort and _is_reasoning_model(model):
+        kwargs["reasoning"] = {"effort": reasoning_effort}
+    if service_tier:
+        kwargs["service_tier"] = service_tier
+    return get_openai().responses.create(**kwargs)
+
+
+def _extract_usage(response) -> dict:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {"prompt_tokens": 0, "completion_tokens": 0,
+                "reasoning_tokens": 0, "cached_tokens": 0,
+                "service_tier": None}
+    in_details = getattr(usage, "input_tokens_details", None)
+    out_details = getattr(usage, "output_tokens_details", None)
+    return {
+        "prompt_tokens": getattr(usage, "input_tokens", 0) or 0,
+        "completion_tokens": getattr(usage, "output_tokens", 0) or 0,
+        "reasoning_tokens": getattr(out_details, "reasoning_tokens", 0) or 0,
+        "cached_tokens": getattr(in_details, "cached_tokens", 0) or 0,
+        "service_tier": getattr(response, "service_tier", None),
+    }
+
+
+def _openrouter_fallback(
+    instructions: str,
+    user_input: str,
+    model: str,
+    reasoning_effort: str | None,
+) -> tuple[str, dict]:
+    """Last-resort fallback through OpenRouter's chat.completions endpoint."""
+    client = _get_openrouter()
+    if client is None:
+        return None  # type: ignore[return-value]
+    or_kwargs: dict = {
+        "model": f"openai/{model}",
+        "messages": [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": user_input},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+    if not _is_reasoning_model(model):
+        or_kwargs["temperature"] = 0
+    if reasoning_effort and _is_reasoning_model(model):
+        or_kwargs["extra_body"] = {"reasoning": {"effort": reasoning_effort}}
+    logger.info(f"Falling back to OpenRouter ({or_kwargs['model']})")
+    resp = client.chat.completions.create(**or_kwargs)
+    text = resp.choices[0].message.content
+    u = getattr(resp, "usage", None)
+    usage = {
+        "prompt_tokens": getattr(u, "prompt_tokens", 0) or 0 if u else 0,
+        "completion_tokens": getattr(u, "completion_tokens", 0) or 0 if u else 0,
+        "reasoning_tokens": 0,
+        "cached_tokens": 0,
+    }
+    return text, usage
+
+
+def _call_llm(
+    instructions: str,
+    user_input: str,
+    model: str,
+    reasoning_effort: str | None,
+    service_tier: str | None,
+    max_retries: int = 3,
+) -> tuple[str, dict]:
+    """Execute the scoring call. Returns (json_text, usage_dict).
+
+    Retry strategy:
+      1. Up to `max_retries` attempts with the requested service_tier
+      2. If still failing on 429/capacity and we were on flex, try standard tier once
+      3. Final fallback: OpenRouter via chat.completions
+    """
+    last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
-            return get_openai().chat.completions.create(messages=messages, **kwargs)
+            resp = _responses_call(instructions, user_input, model, reasoning_effort, service_tier)
+            actual_tier = getattr(resp, "service_tier", None)
+            if service_tier and actual_tier and actual_tier != service_tier:
+                logger.warning(
+                    f"Requested service_tier={service_tier} but got {actual_tier} (silent downgrade)"
+                )
+            return resp.output_text, _extract_usage(resp)
         except Exception as e:
-            if "429" in str(e):
-                last_error = e
-                wait = min(2 ** attempt, 8)
-                logger.warning(f"Rate limited, retry in {wait}s ({attempt+1}/{max_retries})")
-                time.sleep(wait)
-            else:
+            msg = str(e).lower()
+            transient = "429" in msg or "capacity" in msg or "resource_unavailable" in msg
+            if not transient:
                 raise
+            last_error = e
+            wait = min(2 ** attempt, 8)
+            logger.warning(
+                f"Transient API error ({service_tier or 'default'}), retry in {wait}s "
+                f"({attempt+1}/{max_retries}): {e}"
+            )
+            time.sleep(wait)
 
-    # Retries exhausted — try OpenRouter
-    fallback = _get_openrouter()
-    if fallback:
-        model = kwargs.pop("model", "gpt-4.1-mini")
-        kwargs["model"] = f"openai/{model}"
-        logger.info(f"Falling back to OpenRouter ({kwargs['model']})")
-        return fallback.chat.completions.create(messages=messages, **kwargs)
+    if service_tier == "flex":
+        try:
+            logger.info("Flex exhausted — falling back to standard tier")
+            resp = _responses_call(instructions, user_input, model, reasoning_effort, None)
+            return resp.output_text, _extract_usage(resp)
+        except Exception as e:
+            if "429" not in str(e):
+                raise
+            last_error = e
 
+    fb = _openrouter_fallback(instructions, user_input, model, reasoning_effort)
+    if fb is not None:
+        return fb
+
+    assert last_error is not None
     raise last_error
 
 
-def is_excluded_by_title(job: dict, excluded_keywords: list[str]) -> bool:
-    """Return True if job title contains any of the user-defined excluded keywords."""
-    if not excluded_keywords:
-        return False
-    title = job.get("title", "").lower()
-    return any(kw in title for kw in excluded_keywords)
+def build_scoring_prompt(job: dict, profile: dict) -> tuple[str, str]:
+    """Build (instructions, user_input) for the Responses API.
 
+    `instructions` is stable across jobs in a single run — it contains the
+    full scoring rubric PLUS the user's profile (dealbreakers + resume). This
+    lets OpenAI's automatic prefix cache kick in after the first call.
+    `user_input` carries ONLY the job being scored — the variable part.
 
-_EMPTY_BREAKDOWN = {
-    "block1": {"domain": 0, "patterns": 0, "role": 0},
-    "block2": {"tools": 0, "experience": 0},
-    "penalty": 0,
-    "red_flag_count": 0,
-}
-
-# Sub-score caps for server-side clamping (total base max = 100)
-_CAPS = {
-    "domain": 30, "patterns": 25, "role": 15,
-    "tools": 20, "experience": 10,
-}
-
-# Each red flag deducts this many points from the base score
-RED_FLAG_PENALTY = 15
-
-
-def score_job(job: dict, profile: dict) -> dict:
-    """Single-pass scoring with chain-of-thought.
-
-    The model first writes match_summary + red_flags (its reasoning),
-    then assigns sub-scores consistent with that analysis.
-
-    Returns the job dict enriched with:
-      score (int 0-100), score_breakdown (dict), match_summary (str), red_flags (list)
+    Exposed publicly so other tools (model comparison, batch jobs, etc.) can
+    reuse the exact same prompt.
     """
-    # ── Deterministic guard: empty / too-short description ──
     description = (job.get("description") or "").strip()
-    if len(description) < 50:
-        logger.info(f"Empty/short description for '{job.get('title')}' — auto-score 0")
-        job["score"] = 0
-        job["score_breakdown"] = _EMPTY_BREAKDOWN
-        job["match_summary"] = "No job description available."
-        job["red_flags"] = ["No description"]
-        return job
-
     job_text = (
         f"Title: {job.get('title', 'N/A')}\n"
         f"Company: {job.get('company', 'N/A')}\n"
         f"Description:\n{description}"
     )
     profile_text = json.dumps(profile, indent=2)
-
-    # Custom dealbreakers from profile
     dealbreakers = profile.get("custom_red_flags") or []
 
-    # ── Build system prompt ──
-    system_content = (
+    instructions = (
         "You are a strict job-candidate fit evaluator. "
         "Score ONLY using facts explicitly stated in the candidate profile. "
         "Do NOT infer, assume, or guess any skills, experience, or qualifications.\n\n"
@@ -143,7 +230,7 @@ def score_job(job: dict, profile: dict) -> dict:
 
     if dealbreakers:
         items = "\n".join(f"- {d}" for d in dealbreakers)
-        system_content += (
+        instructions += (
             "DEALBREAKERS (HARD BLOCKERS) — CHECK BEFORE ANYTHING ELSE:\n"
             f"{items}\n\n"
             "How to apply them:\n"
@@ -165,7 +252,7 @@ def score_job(job: dict, profile: dict) -> dict:
             "  3. Tech stack / tool match does NOT override a dealbreaker. No exceptions.\n\n"
         )
 
-    system_content += (
+    instructions += (
         "YOUR TASK — analyse the job against the candidate in THREE steps:\n\n"
 
         "STEP 1: Write match_summary (1-2 sentences).\n"
@@ -279,28 +366,91 @@ def score_job(job: dict, profile: dict) -> dict:
         '  "red_flags": ["<flag1>", ...],\n'
         '  "block1": {"domain": <int>, "patterns": <int>, "role": <int>},\n'
         '  "block2": {"tools": <int>, "experience": <int>}\n'
-        "}"
+        "}\n\n"
+
+        f"CANDIDATE PROFILE:\n{profile_text}"
     )
 
-    response = _chat_completion(
-        model="gpt-4.1-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": f"PROFILE:\n{profile_text}\n\nJOB:\n{job_text}"},
-        ],
-    )
-    result = json.loads(response.choices[0].message.content)
+    user_input = f"Score this job and return JSON per the instructions.\n\nJOB:\n{job_text}"
+    return instructions, user_input
 
-    # ── Extract text fields ──
+
+def is_excluded_by_title(job: dict, excluded_keywords: list[str]) -> bool:
+    """Return True if job title contains any of the user-defined excluded keywords."""
+    if not excluded_keywords:
+        return False
+    title = job.get("title", "").lower()
+    return any(kw in title for kw in excluded_keywords)
+
+
+_EMPTY_BREAKDOWN = {
+    "block1": {"domain": 0, "patterns": 0, "role": 0},
+    "block2": {"tools": 0, "experience": 0},
+    "penalty": 0,
+    "red_flag_count": 0,
+}
+
+# Sub-score caps for server-side clamping (total base max = 100)
+_CAPS = {
+    "domain": 30, "patterns": 25, "role": 15,
+    "tools": 20, "experience": 10,
+}
+
+# Each red flag deducts this many points from the base score
+RED_FLAG_PENALTY = 15
+
+
+def score_job(
+    job: dict,
+    profile: dict,
+    model: str = "gpt-5-mini",
+    reasoning_effort: str | None = "minimal",
+    service_tier: str | None = "flex",
+) -> dict:
+    """Single-pass scoring with chain-of-thought via the Responses API.
+
+    Args:
+        model: OpenAI model id. Default gpt-5-mini.
+        reasoning_effort: for gpt-5*/o-series — "minimal"|"low"|"medium"|"high".
+            Ignored for models that don't support reasoning.
+        service_tier: "flex" (default; ~50% cheaper, slower) or None for default tier.
+
+    Returns the job dict enriched with:
+      score, score_breakdown, match_summary, red_flags, and for diagnostics
+      _usage {prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens},
+      _latency_ms.
+    """
+    description = (job.get("description") or "").strip()
+    if len(description) < 50:
+        logger.info(f"Empty/short description for '{job.get('title')}' — auto-score 0")
+        job["score"] = 0
+        job["score_breakdown"] = _EMPTY_BREAKDOWN
+        job["match_summary"] = "No job description available."
+        job["red_flags"] = ["No description"]
+        return job
+
+    instructions, user_input = build_scoring_prompt(job, profile)
+
+    t0 = time.perf_counter()
+    json_text, usage = _call_llm(
+        instructions=instructions,
+        user_input=user_input,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
+    )
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+    result = json.loads(json_text)
+
+    job["_usage"] = usage
+    job["_latency_ms"] = latency_ms
+
     job["match_summary"] = result.get("match_summary", "")
     job["red_flags"] = result.get("red_flags", [])
 
-    # ── Server-side recomputation (don't trust LLM arithmetic) ──
+    # Server-side recomputation (don't trust LLM arithmetic)
     b1 = result.get("block1", {})
     b2 = result.get("block2", {})
-
-    # Clamp sub-scores to valid ranges
     b1 = {k: min(max(b1.get(k, 0), 0), _CAPS[k]) for k in ("domain", "patterns", "role")}
     b2 = {k: min(max(b2.get(k, 0), 0), _CAPS[k]) for k in ("tools", "experience")}
 
@@ -318,7 +468,6 @@ def score_job(job: dict, profile: dict) -> dict:
     return job
 
 
-# Keep quick_score as a thin wrapper for backward compatibility with process_jobs.py
 def quick_score(job: dict, profile: dict) -> tuple[int, dict]:
     """Score a job and return (score, breakdown). Also sets match_summary/red_flags on the job dict."""
     enriched = score_job(job, profile)
@@ -330,7 +479,6 @@ if __name__ == "__main__":
         print("Usage: python score_job.py '<job_json>'")
         sys.exit(1)
 
-    # For testing: load profile from Supabase
     from supabase import create_client
     sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
     profile_result = sb.table("profile").select("parsed").order("updated_at", desc=True).limit(1).execute()
