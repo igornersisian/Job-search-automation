@@ -86,6 +86,17 @@ _COMPANY_SUFFIXES = [
     ", pty", " pty",
 ]
 
+# Trade descriptors stripped from the company tail so that
+# "NineTwoThree AI Studio" (LinkedIn) and "ninetwothree, Inc." (Glassdoor)
+# collapse to the same dedup key. Only applied when the remaining stem
+# stays ≥ 3 chars and ≥ 1 word — protects single-word names like "AI".
+_COMPANY_TRADE_WORDS = {
+    "ai", "studio", "studios", "labs", "lab",
+    "software", "technologies", "technology", "tech",
+    "solutions", "systems", "group", "holdings",
+    "digital", "media",
+}
+
 
 def _normalise_title(title: str) -> str:
     """Normalise a job title for dedup comparison."""
@@ -110,7 +121,15 @@ def _normalise_company(company: str) -> str:
             break
     # Remove trailing punctuation
     c = c.rstrip(".,")
-    return c
+    # Strip trade descriptors from the tail ("ninetwothree ai studio" → "ninetwothree").
+    # Guard: never collapse to a stem shorter than 3 chars — preserves short real names.
+    words = c.split()
+    while len(words) > 1 and words[-1] in _COMPANY_TRADE_WORDS:
+        stem = " ".join(words[:-1])
+        if len(stem) < 3:
+            break
+        words = words[:-1]
+    return " ".join(words)
 
 
 def _description_similarity(desc_a: str, desc_b: str) -> float:
