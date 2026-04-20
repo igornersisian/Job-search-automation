@@ -202,27 +202,16 @@ def _call_llm(
     raise last_error
 
 
-def build_scoring_prompt(job: dict, profile: dict) -> tuple[str, str]:
-    """Build (instructions, user_input) for the Responses API.
+def _build_rules_text(profile: dict) -> str:
+    """Scoring rubric + dealbreakers only (no profile body).
 
-    `instructions` is stable across jobs in a single run — it contains the
-    full scoring rubric PLUS the user's profile (dealbreakers + resume). This
-    lets OpenAI's automatic prefix cache kick in after the first call.
-    `user_input` carries ONLY the job being scored — the variable part.
-
-    Exposed publicly so other tools (model comparison, batch jobs, etc.) can
-    reuse the exact same prompt.
+    Shared helper so experiment scripts (e.g. semi-naive baseline) can reuse
+    the exact same rubric, isolating prompt-structure differences from any
+    drift in the rules themselves.
     """
-    description = (job.get("description") or "").strip()
-    job_text = (
-        f"Title: {job.get('title', 'N/A')}\n"
-        f"Company: {job.get('company', 'N/A')}\n"
-        f"Description:\n{description}"
-    )
-    profile_text = json.dumps(profile, indent=2)
     dealbreakers = profile.get("custom_red_flags") or []
 
-    instructions = (
+    text = (
         "You are a strict job-candidate fit evaluator. "
         "Score ONLY using facts explicitly stated in the candidate profile. "
         "Do NOT infer, assume, or guess any skills, experience, or qualifications.\n\n"
@@ -230,7 +219,7 @@ def build_scoring_prompt(job: dict, profile: dict) -> tuple[str, str]:
 
     if dealbreakers:
         items = "\n".join(f"- {d}" for d in dealbreakers)
-        instructions += (
+        text += (
             "DEALBREAKERS (HARD BLOCKERS) — CHECK BEFORE ANYTHING ELSE:\n"
             f"{items}\n\n"
             "How to apply them:\n"
@@ -252,7 +241,7 @@ def build_scoring_prompt(job: dict, profile: dict) -> tuple[str, str]:
             "  3. Tech stack / tool match does NOT override a dealbreaker. No exceptions.\n\n"
         )
 
-    instructions += (
+    text += (
         "YOUR TASK — analyse the job against the candidate in THREE steps:\n\n"
 
         "STEP 1: Write match_summary (1-2 sentences).\n"
@@ -366,11 +355,32 @@ def build_scoring_prompt(job: dict, profile: dict) -> tuple[str, str]:
         '  "red_flags": ["<flag1>", ...],\n'
         '  "block1": {"domain": <int>, "patterns": <int>, "role": <int>},\n'
         '  "block2": {"tools": <int>, "experience": <int>}\n'
-        "}\n\n"
-
-        f"CANDIDATE PROFILE:\n{profile_text}"
+        "}"
     )
 
+    return text
+
+
+def build_scoring_prompt(job: dict, profile: dict) -> tuple[str, str]:
+    """Build (instructions, user_input) for the Responses API.
+
+    `instructions` is stable across jobs in a single run — it contains the
+    full scoring rubric PLUS the user's profile (dealbreakers + resume). This
+    lets OpenAI's automatic prefix cache kick in after the first call.
+    `user_input` carries ONLY the job being scored — the variable part.
+
+    Exposed publicly so other tools (model comparison, batch jobs, etc.) can
+    reuse the exact same prompt.
+    """
+    description = (job.get("description") or "").strip()
+    job_text = (
+        f"Title: {job.get('title', 'N/A')}\n"
+        f"Company: {job.get('company', 'N/A')}\n"
+        f"Description:\n{description}"
+    )
+    profile_text = json.dumps(profile, indent=2)
+
+    instructions = _build_rules_text(profile) + f"\n\nCANDIDATE PROFILE:\n{profile_text}"
     user_input = f"Score this job and return JSON per the instructions.\n\nJOB:\n{job_text}"
     return instructions, user_input
 
