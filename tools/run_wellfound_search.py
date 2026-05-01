@@ -12,15 +12,15 @@ Usage:
     python tools/run_wellfound_search.py
 """
 
-import os
 import json
 import re
 import time
 import logging
 from datetime import datetime, timezone
 
-import httpx
 from dotenv import load_dotenv
+
+import apify_client
 
 load_dotenv()
 
@@ -31,10 +31,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ACTOR_ID = "clearpath~wellfound-api-ppe"
-
-
-def _get_token() -> str:
-    return os.environ["APIFY_API_TOKEN"]
 
 
 def _role_to_slug(role: str) -> str:
@@ -67,9 +63,8 @@ def _build_urls(roles: list[str]) -> list[str]:
     return urls
 
 
-def run_actor(roles: list[str]) -> str:
+def run_actor(roles: list[str]) -> tuple[str, str]:
     url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
-    params = {"token": _get_token()}
     search_urls = _build_urls(roles)
 
     actor_input = {
@@ -78,23 +73,22 @@ def run_actor(roles: list[str]) -> str:
         "onlyRemoteJobs": True,
         "sortBy": "LAST_POSTED",
     }
-    logger.info(f"Starting Wellfound actor run with {len(search_urls)} keyword URLs (pageLimit=1)...")
-    resp = httpx.post(url, json=actor_input, params=params, timeout=30)
+    logger.info(f"Starting Wellfound actor run with {len(search_urls)} keyword URLs (pageLimit=1, {apify_client.active_slot_summary()})...")
+    resp, token = apify_client.post(url, json_body=actor_input, timeout=30)
     if resp.status_code >= 400:
         logger.error(f"Wellfound actor start failed ({resp.status_code}): {resp.text[:500]}")
     resp.raise_for_status()
     run_id = resp.json()["data"]["id"]
     logger.info(f"Wellfound actor run started: {run_id}")
-    return run_id
+    return run_id, token
 
 
-def wait_for_run(run_id: str, timeout_seconds: int = 600) -> str:
+def wait_for_run(run_id: str, token: str, timeout_seconds: int = 600) -> str:
     url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    params = {"token": _get_token()}
     deadline = time.time() + timeout_seconds
 
     while time.time() < deadline:
-        resp = httpx.get(url, params=params, timeout=15)
+        resp = apify_client.get(url, token, timeout=15)
         resp.raise_for_status()
         data = resp.json()["data"]
         status = data["status"]
@@ -104,7 +98,9 @@ def wait_for_run(run_id: str, timeout_seconds: int = 600) -> str:
             logger.info(f"Wellfound run succeeded. Dataset: {dataset_id}")
             return dataset_id
         elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
-            raise RuntimeError(f"Wellfound actor run ended with status: {status}")
+            status_msg = data.get("statusMessage") or ""
+            apify_client.report_run_failure(token, status, status_msg)
+            raise RuntimeError(f"Wellfound actor run ended with status: {status} ({status_msg[:200]})")
 
         logger.info(f"Wellfound run status: {status}. Waiting...")
         time.sleep(10)
@@ -112,11 +108,10 @@ def wait_for_run(run_id: str, timeout_seconds: int = 600) -> str:
     raise TimeoutError(f"Wellfound actor run {run_id} did not finish within {timeout_seconds}s")
 
 
-def fetch_dataset(dataset_id: str) -> list[dict]:
+def fetch_dataset(dataset_id: str, token: str) -> list[dict]:
     url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-    params = {"token": _get_token(), "format": "json", "clean": "true"}
     logger.info(f"Downloading Wellfound dataset {dataset_id}...")
-    resp = httpx.get(url, params=params, timeout=60)
+    resp = apify_client.get(url, token, params={"format": "json", "clean": "true"}, timeout=60)
     resp.raise_for_status()
     items = resp.json()
     logger.info(f"Downloaded {len(items)} Wellfound jobs")
@@ -195,9 +190,9 @@ def run_search(keywords: list[str], profile: dict | None = None) -> list[dict]:
         return []
 
     logger.info(f"Wellfound roles ({len(roles)}): {roles}")
-    run_id = run_actor(roles)
-    dataset_id = wait_for_run(run_id)
-    raw_items = fetch_dataset(dataset_id)
+    run_id, token = run_actor(roles)
+    dataset_id = wait_for_run(run_id, token)
+    raw_items = fetch_dataset(dataset_id, token)
     return [normalise_wellfound(item) for item in raw_items]
 
 

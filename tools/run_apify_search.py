@@ -8,13 +8,13 @@ Usage:
     python tools/run_apify_search.py
 """
 
-import os
 import json
 import time
 import logging
 
-import httpx
 from dotenv import load_dotenv
+
+import apify_client
 
 load_dotenv()
 
@@ -27,14 +27,9 @@ logger = logging.getLogger(__name__)
 ACTOR_ID = "2rJKkhh7vjpX7pvjg"  # cheap_scraper/linkedin-job-scraper
 
 
-def _get_token() -> str:
-    return os.environ["APIFY_API_TOKEN"]
-
-
-def run_actor(keywords: list[str]) -> str:
-    """Start the Apify actor run and return run_id."""
+def run_actor(keywords: list[str]) -> tuple[str, str]:
+    """Start the Apify actor run. Returns (run_id, token_used)."""
     url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
-    params = {"token": _get_token()}
     actor_input = {
         "keyword": keywords,
         "publishedAt": "r86400",          # last 24 hours
@@ -43,25 +38,24 @@ def run_actor(keywords: list[str]) -> str:
         "saveOnlyUniqueItems": True,
     }
 
-    logger.info(f"Starting LinkedIn actor run with {len(keywords)} keywords...")
-    resp = httpx.post(url, json=actor_input, params=params, timeout=30)
+    logger.info(f"Starting LinkedIn actor run with {len(keywords)} keywords ({apify_client.active_slot_summary()})...")
+    resp, token = apify_client.post(url, json_body=actor_input, timeout=30)
     if resp.status_code >= 400:
         logger.error(f"LinkedIn actor start failed ({resp.status_code}): {resp.text[:500]}")
     resp.raise_for_status()
 
     run_id = resp.json()["data"]["id"]
     logger.info(f"LinkedIn actor run started: {run_id}")
-    return run_id
+    return run_id, token
 
 
-def wait_for_run(run_id: str, timeout_seconds: int = 600) -> str:
+def wait_for_run(run_id: str, token: str, timeout_seconds: int = 600) -> str:
     """Poll until the run is SUCCEEDED, return dataset_id."""
     url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    params = {"token": _get_token()}
     deadline = time.time() + timeout_seconds
 
     while time.time() < deadline:
-        resp = httpx.get(url, params=params, timeout=15)
+        resp = apify_client.get(url, token, timeout=15)
         resp.raise_for_status()
         data = resp.json()["data"]
         status = data["status"]
@@ -71,7 +65,9 @@ def wait_for_run(run_id: str, timeout_seconds: int = 600) -> str:
             logger.info(f"LinkedIn run succeeded. Dataset: {dataset_id}")
             return dataset_id
         elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
-            raise RuntimeError(f"LinkedIn actor run {run_id} ended with status: {status}")
+            status_msg = data.get("statusMessage") or ""
+            apify_client.report_run_failure(token, status, status_msg)
+            raise RuntimeError(f"LinkedIn actor run {run_id} ended with status: {status} ({status_msg[:200]})")
 
         logger.info(f"LinkedIn run status: {status}. Waiting...")
         time.sleep(10)
@@ -79,13 +75,11 @@ def wait_for_run(run_id: str, timeout_seconds: int = 600) -> str:
     raise TimeoutError(f"LinkedIn actor run {run_id} did not finish within {timeout_seconds}s")
 
 
-def fetch_dataset(dataset_id: str) -> list[dict]:
+def fetch_dataset(dataset_id: str, token: str) -> list[dict]:
     """Download all items from an Apify dataset."""
     url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-    params = {"token": _get_token(), "format": "json", "clean": "true"}
-
     logger.info(f"Downloading LinkedIn dataset {dataset_id}...")
-    resp = httpx.get(url, params=params, timeout=60)
+    resp = apify_client.get(url, token, params={"format": "json", "clean": "true"}, timeout=60)
     resp.raise_for_status()
 
     items = resp.json()
@@ -114,9 +108,9 @@ def normalise_linkedin(raw: dict) -> dict:
 
 def run_search(keywords: list[str]) -> list[dict]:
     """Full flow: trigger -> wait -> fetch -> normalise. Returns list of job dicts."""
-    run_id = run_actor(keywords)
-    dataset_id = wait_for_run(run_id)
-    raw_items = fetch_dataset(dataset_id)
+    run_id, token = run_actor(keywords)
+    dataset_id = wait_for_run(run_id, token)
+    raw_items = fetch_dataset(dataset_id, token)
     return [normalise_linkedin(item) for item in raw_items]
 
 

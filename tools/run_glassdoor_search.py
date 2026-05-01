@@ -9,14 +9,14 @@ Usage:
     python tools/run_glassdoor_search.py
 """
 
-import os
 import json
 import time
 import logging
 from datetime import datetime, timezone, timedelta
 
-import httpx
 from dotenv import load_dotenv
+
+import apify_client
 
 load_dotenv()
 
@@ -29,37 +29,31 @@ logger = logging.getLogger(__name__)
 ACTOR_ID = "5OaooRg0FxlRF0L1B"
 
 
-def _get_token() -> str:
-    return os.environ["APIFY_API_TOKEN"]
-
-
-def run_actor(keyword: str) -> str:
-    """Start one Glassdoor actor run for a single keyword."""
+def run_actor(keyword: str) -> tuple[str, str]:
+    """Start one Glassdoor actor run for a single keyword. Returns (run_id, token_used)."""
     url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
-    params = {"token": _get_token()}
     actor_input = {
         "keywords": keyword,
         "location": "United States",
         "daysOld": 1,
         "limit": 25,
     }
-    logger.info(f"Starting Glassdoor actor run: '{keyword}'")
-    resp = httpx.post(url, json=actor_input, params=params, timeout=30)
+    logger.info(f"Starting Glassdoor actor run: '{keyword}' ({apify_client.active_slot_summary()})")
+    resp, token = apify_client.post(url, json_body=actor_input, timeout=30)
     if resp.status_code >= 400:
         logger.error(f"Glassdoor actor start failed ({resp.status_code}): {resp.text[:500]}")
     resp.raise_for_status()
     run_id = resp.json()["data"]["id"]
     logger.info(f"Glassdoor actor run started: {run_id}")
-    return run_id
+    return run_id, token
 
 
-def wait_for_run(run_id: str, timeout_seconds: int = 600) -> str:
+def wait_for_run(run_id: str, token: str, timeout_seconds: int = 600) -> str:
     url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    params = {"token": _get_token()}
     deadline = time.time() + timeout_seconds
 
     while time.time() < deadline:
-        resp = httpx.get(url, params=params, timeout=15)
+        resp = apify_client.get(url, token, timeout=15)
         resp.raise_for_status()
         data = resp.json()["data"]
         status = data["status"]
@@ -69,7 +63,9 @@ def wait_for_run(run_id: str, timeout_seconds: int = 600) -> str:
             logger.info(f"Glassdoor run succeeded. Dataset: {dataset_id}")
             return dataset_id
         elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
-            raise RuntimeError(f"Glassdoor actor run ended with status: {status}")
+            status_msg = data.get("statusMessage") or ""
+            apify_client.report_run_failure(token, status, status_msg)
+            raise RuntimeError(f"Glassdoor actor run ended with status: {status} ({status_msg[:200]})")
 
         logger.info(f"Glassdoor run status: {status}. Waiting...")
         time.sleep(10)
@@ -77,11 +73,10 @@ def wait_for_run(run_id: str, timeout_seconds: int = 600) -> str:
     raise TimeoutError(f"Glassdoor actor run {run_id} did not finish within {timeout_seconds}s")
 
 
-def fetch_dataset(dataset_id: str) -> list[dict]:
+def fetch_dataset(dataset_id: str, token: str) -> list[dict]:
     url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-    params = {"token": _get_token(), "format": "json", "clean": "true"}
     logger.info(f"Downloading Glassdoor dataset {dataset_id}...")
-    resp = httpx.get(url, params=params, timeout=60)
+    resp = apify_client.get(url, token, params={"format": "json", "clean": "true"}, timeout=60)
     resp.raise_for_status()
     items = resp.json()
     logger.info(f"Downloaded {len(items)} Glassdoor jobs")
@@ -136,9 +131,9 @@ def normalise_glassdoor(raw: dict) -> dict:
 
 def _search_one(keyword: str) -> list[dict]:
     """Run a single keyword search end-to-end."""
-    run_id = run_actor(keyword)
-    dataset_id = wait_for_run(run_id)
-    return fetch_dataset(dataset_id)
+    run_id, token = run_actor(keyword)
+    dataset_id = wait_for_run(run_id, token)
+    return fetch_dataset(dataset_id, token)
 
 
 def run_search(keywords: list[str]) -> list[dict]:
