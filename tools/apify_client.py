@@ -133,6 +133,23 @@ def is_credit_error(status_code: int, body: str) -> bool:
     return any(s in body_lower for s in _CREDIT_ERROR_SUBSTRINGS)
 
 
+def is_invalid_token_error(status_code: int, body: str) -> bool:
+    """True if the response indicates the token itself is invalid/revoked.
+
+    Apify returns 401 with type 'user-or-token-not-found' when a token has
+    been deleted or mistyped — distinct from a credit error, but rotation
+    should still help (the other slots may be valid).
+    """
+    if status_code != 401:
+        return False
+    body_lower = (body or "").lower()
+    return (
+        "user-or-token-not-found" in body_lower
+        or "authentication token is not valid" in body_lower
+        or "token-not-found" in body_lower
+    )
+
+
 def looks_like_credit_failure_message(msg: str) -> bool:
     """For run statusMessage strings on FAILED/ABORTED runs."""
     if not msg:
@@ -193,7 +210,9 @@ def post(
             mark_exhausted(idx, f"network error: {e}")
             continue
 
-        if is_credit_error(resp.status_code, resp.text):
+        if is_credit_error(resp.status_code, resp.text) or is_invalid_token_error(
+            resp.status_code, resp.text
+        ):
             mark_exhausted(
                 idx, f"HTTP {resp.status_code}: {resp.text[:200]}"
             )
