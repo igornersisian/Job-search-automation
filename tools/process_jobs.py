@@ -315,7 +315,17 @@ def run_pipeline() -> None:
     logger.info("=== Daily job search pipeline started ===")
 
     # Load profile
-    profile = get_profile()
+    try:
+        profile = get_profile()
+    except Exception as e:
+        msg = f"⚠️ Pipeline failed — cannot reach Supabase: {e}\n\nYour Supabase project may be paused (free tier auto-pauses after 1 week). Resume it at supabase.com/dashboard."
+        logger.error(msg)
+        try:
+            from notify_telegram import send_message
+            send_message(msg, parse_mode=None)
+        except Exception:
+            pass
+        raise
     if not profile:
         logger.error("No resume profile in Supabase. Send PDF to Telegram bot first.")
         return
