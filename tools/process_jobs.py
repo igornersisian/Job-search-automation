@@ -249,16 +249,22 @@ def normalise_job(raw: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def _fetch_all_sources(keywords: list[str], profile: dict) -> list[dict]:
-    """Run all scrapers in parallel, return merged job list."""
+    """Run all scrapers and return merged job list.
+
+    The 5 lightweight scrapers run in parallel first. ATS runs after they have
+    started (their Apify actors are RUNNING) so it doesn't compete for the
+    8192 MB per-account memory cap. ATS alone needs 4096 MB; the other 5
+    together need ~5760 MB, so all 6 simultaneous would exceed the limit.
+    """
     raw_jobs: list[dict] = []
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    # Phase 1: start the 5 lightweight scrapers in parallel
+    with ThreadPoolExecutor(max_workers=5) as executor:
         future_linkedin = executor.submit(run_linkedin_search, keywords)
         future_glassdoor = executor.submit(run_glassdoor_search, keywords)
         future_indeed = executor.submit(run_indeed_search, keywords)
         future_wellfound = executor.submit(run_wellfound_search, keywords, profile)
         future_remoteboards = executor.submit(run_remoteboards_search, keywords)
-        future_ats = executor.submit(run_ats_search, keywords)
 
         for name, future in [
             ("LinkedIn", future_linkedin),
@@ -266,7 +272,6 @@ def _fetch_all_sources(keywords: list[str], profile: dict) -> list[dict]:
             ("Indeed", future_indeed),
             ("Wellfound", future_wellfound),
             ("RemoteBoards", future_remoteboards),
-            ("ATS", future_ats),
         ]:
             try:
                 jobs = future.result()
@@ -274,6 +279,14 @@ def _fetch_all_sources(keywords: list[str], profile: dict) -> list[dict]:
                 logger.info(f"{name}: {len(jobs)} jobs")
             except Exception as e:
                 logger.error(f"{name} search failed: {e}")
+
+    # Phase 2: run ATS after the others have finished (memory freed on Apify)
+    try:
+        ats_jobs = run_ats_search(keywords)
+        raw_jobs.extend(ats_jobs)
+        logger.info(f"ATS: {len(ats_jobs)} jobs")
+    except Exception as e:
+        logger.error(f"ATS search failed: {e}")
 
     return raw_jobs
 
