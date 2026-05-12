@@ -75,38 +75,54 @@ def _fingerprint(token: str) -> str:
     return token[-4:] if len(token) >= 4 else "????"
 
 
-def _current_month() -> str:
+_EXHAUSTED_TTL_DAYS = 30
+
+
+def _now_iso() -> str:
     from datetime import datetime, timezone
-    return datetime.now(timezone.utc).strftime("%Y-%m")
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def _load_state() -> dict:
+    """Load state, dropping any slots exhausted more than 30 days ago."""
+    from datetime import date, timedelta
+    cutoff = (date.today() - timedelta(days=_EXHAUSTED_TTL_DAYS)).isoformat()
+
     if STATE_FILE.exists():
         try:
             state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            # Auto-reset exhausted slots when a new billing month starts
-            saved_month = state.get("month")
-            current_month = _current_month()
-            if saved_month and saved_month != current_month:
-                logger.info(
-                    f"New billing month ({saved_month} → {current_month}): "
-                    f"clearing {len(state.get('exhausted', []))} exhausted Apify slots"
-                )
-                return {"month": current_month, "exhausted": []}
+            # Migrate old format {"exhausted": [0,1,...]} → new format {"exhausted": {"0": "date"}}
+            raw = state.get("exhausted", {})
+            if isinstance(raw, list):
+                today = _now_iso()
+                raw = {str(i): today for i in raw}
+                state["exhausted"] = raw
+
+            expired = [int(k) for k, v in raw.items() if v <= cutoff]
+            if expired:
+                for k in expired:
+                    logger.info(
+                        f"Apify slot {k + 1} exhausted on {raw[str(k)]} (>{_EXHAUSTED_TTL_DAYS}d ago) — auto-reset"
+                    )
+                    del raw[str(k)]
+                state["exhausted"] = raw
+                _save_state(state)
             return state
         except Exception:
             logger.warning(f"Could not parse {STATE_FILE}, treating as empty")
-    return {"month": _current_month(), "exhausted": []}
+    return {"exhausted": {}}
 
 
 def _save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    state.setdefault("month", _current_month())
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
 def _exhausted_set() -> set[int]:
-    return set(_load_state().get("exhausted", []))
+    raw = _load_state().get("exhausted", {})
+    if isinstance(raw, list):
+        return set(raw)
+    return {int(k) for k in raw}
 
 
 def get_active_token() -> tuple[int, str]:
@@ -128,11 +144,13 @@ def get_active_token() -> tuple[int, str]:
 
 def mark_exhausted(index: int, reason: str = "") -> None:
     state = _load_state()
-    exhausted = set(state.get("exhausted", []))
-    if index in exhausted:
+    raw = state.get("exhausted", {})
+    if isinstance(raw, list):
+        raw = {str(i): _now_iso() for i in raw}
+    if str(index) in raw:
         return
-    exhausted.add(index)
-    state["exhausted"] = sorted(exhausted)
+    raw[str(index)] = _now_iso()
+    state["exhausted"] = raw
     _save_state(state)
     tokens = _load_tokens()
     fp = _fingerprint(tokens[index]) if index < len(tokens) else "????"
