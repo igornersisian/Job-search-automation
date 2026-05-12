@@ -149,6 +149,10 @@ def _description_similarity(desc_a: str, desc_b: str) -> float:
 
 
 DEDUP_SIMILARITY_THRESHOLD = 0.45
+# When two jobs share the same company but have different titles, deduplicate if
+# their descriptions are nearly identical — catches template variants like
+# "Python AI Trainer" vs "JavaScript AI Trainer" from the same employer.
+COMPANY_VARIANT_SIM_THRESHOLD = 0.75
 
 
 DEFAULT_SCORE_THRESHOLD = 70
@@ -393,9 +397,11 @@ def run_pipeline() -> None:
     logger.info(f"Batch dedup: {len(already_seen_ids)} already seen out of {len(all_raw_ids)} raw IDs")
 
     processed_ids: set[str] = set()
-    # Smart dedup: group jobs by normalised title+company, then check description similarity
-    # Key: "normalised_title|normalised_company" → list of jobs with that key
+    # Two dedup indexes:
+    # 1. norm_title|norm_company → catches same title from different sources
+    # 2. norm_company            → catches template variants (same employer, same description, different title)
     fuzzy_groups: dict[str, list[dict]] = {}
+    company_jobs: dict[str, list[dict]] = {}
 
     for raw in raw_jobs:
         job = normalise_job(raw)
@@ -436,12 +442,29 @@ def run_pipeline() -> None:
                     is_duplicate = True
                     break
 
+        # Cross-title dedup: same company, different title — catch template variants
+        # e.g. "Python AI Trainer" vs "JavaScript AI Trainer" from Outlier AI
+        if not is_duplicate and norm_company in company_jobs:
+            for existing_job in company_jobs[norm_company]:
+                sim = _description_similarity(
+                    job.get("description", ""),
+                    existing_job.get("description", ""),
+                )
+                if sim >= COMPANY_VARIANT_SIM_THRESHOLD:
+                    logger.info(
+                        f"[DEDUP-VARIANT] '{job['title']}' @ {job['company']} ({job.get('source')}) "
+                        f"≈ '{existing_job['title']}' (same company, similarity={sim:.0%})"
+                    )
+                    is_duplicate = True
+                    break
+
         if is_duplicate:
             dupes_fuzzy += 1
             continue
 
-        # Not a duplicate — register in fuzzy group
+        # Not a duplicate — register in both indexes
         fuzzy_groups.setdefault(dedup_key, []).append(job)
+        company_jobs.setdefault(norm_company, []).append(job)
 
         # Title exclusion filter
         if is_excluded_by_title(job, excluded_title_kw):
