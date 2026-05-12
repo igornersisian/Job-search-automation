@@ -248,8 +248,8 @@ def normalise_job(raw: dict) -> dict:
 # Parallel scraper fetch
 # ---------------------------------------------------------------------------
 
-def _fetch_all_sources(keywords: list[str], profile: dict) -> list[dict]:
-    """Run all scrapers and return merged job list.
+def _fetch_all_sources(keywords: list[str], profile: dict) -> tuple[list[dict], dict[str, str]]:
+    """Run all scrapers and return (merged job list, source errors).
 
     The 5 lightweight scrapers run in parallel first. ATS runs after they have
     started (their Apify actors are RUNNING) so it doesn't compete for the
@@ -257,6 +257,7 @@ def _fetch_all_sources(keywords: list[str], profile: dict) -> list[dict]:
     together need ~5760 MB, so all 6 simultaneous would exceed the limit.
     """
     raw_jobs: list[dict] = []
+    source_errors: dict[str, str] = {}
 
     # Phase 1: start the 5 lightweight scrapers in parallel
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -279,6 +280,7 @@ def _fetch_all_sources(keywords: list[str], profile: dict) -> list[dict]:
                 logger.info(f"{name}: {len(jobs)} jobs")
             except Exception as e:
                 logger.error(f"{name} search failed: {e}")
+                source_errors[name] = str(e)[:120]
 
     # Phase 2: run ATS after the others have finished (memory freed on Apify)
     try:
@@ -287,8 +289,9 @@ def _fetch_all_sources(keywords: list[str], profile: dict) -> list[dict]:
         logger.info(f"ATS: {len(ats_jobs)} jobs")
     except Exception as e:
         logger.error(f"ATS search failed: {e}")
+        source_errors["ATS"] = str(e)[:120]
 
-    return raw_jobs
+    return raw_jobs, source_errors
 
 
 # ---------------------------------------------------------------------------
@@ -363,10 +366,16 @@ def run_pipeline() -> None:
         logger.info("No excluded title keywords set — title filter disabled")
 
     # ── Phase 0: Fetch jobs from all sources in parallel ─────────────
-    raw_jobs = _fetch_all_sources(keywords, profile)
+    raw_jobs, source_errors = _fetch_all_sources(keywords, profile)
 
     if not raw_jobs:
         logger.error("No jobs fetched from any source.")
+        msg = "⚠️ Pipeline finished — 0 jobs fetched from all sources."
+        if source_errors:
+            msg += "\n\nFailed sources:\n" + "\n".join(
+                f"• {k}: {v}" for k, v in source_errors.items()
+            )
+        send_message(msg, parse_mode=None)
         return
 
     logger.info(f"Total raw jobs: {len(raw_jobs)}")
@@ -493,6 +502,7 @@ def run_pipeline() -> None:
         dupes_local=dupes_local,
         dupes_fuzzy=dupes_fuzzy,
         threshold=threshold,
+        source_errors=source_errors,
     )
 
 

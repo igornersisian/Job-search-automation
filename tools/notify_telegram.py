@@ -27,16 +27,18 @@ def _telegram_api() -> str:
     return f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}"
 
 
-def send_message(text: str, parse_mode: str = "Markdown") -> dict:
+def send_message(text: str, parse_mode: str | None = "Markdown") -> dict:
     """Send a text message to the configured chat."""
+    payload: dict = {
+        "chat_id": os.environ["TELEGRAM_CHAT_ID"],
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     resp = httpx.post(
         f"{_telegram_api()}/sendMessage",
-        json={
-            "chat_id": os.environ["TELEGRAM_CHAT_ID"],
-            "text": text,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        },
+        json=payload,
         timeout=15,
     )
     resp.raise_for_status()
@@ -136,6 +138,7 @@ def send_daily_summary(
     dupes_crossrun: int = 0,
     dupes_local: int = 0,
     dupes_fuzzy: int = 0,
+    source_errors: dict | None = None,
 ) -> None:
     """Send a brief daily pipeline summary."""
     dupe_detail = ""
@@ -156,6 +159,9 @@ def send_daily_summary(
         f"🚫 Excluded by title: {skipped_excluded}\n"
         f"♻️ Duplicates skipped: {skipped_dupe}{dupe_detail}"
     )
+    if source_errors:
+        error_lines = "\n".join(f"• {k}: {v}" for k, v in source_errors.items())
+        text += f"\n\n⚠️ *Failed sources ({len(source_errors)}):*\n{error_lines}"
     try:
         send_message(text)
     except Exception as e:
