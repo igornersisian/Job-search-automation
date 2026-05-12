@@ -75,17 +75,33 @@ def _fingerprint(token: str) -> str:
     return token[-4:] if len(token) >= 4 else "????"
 
 
+def _current_month() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
 def _load_state() -> dict:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            # Auto-reset exhausted slots when a new billing month starts
+            saved_month = state.get("month")
+            current_month = _current_month()
+            if saved_month and saved_month != current_month:
+                logger.info(
+                    f"New billing month ({saved_month} → {current_month}): "
+                    f"clearing {len(state.get('exhausted', []))} exhausted Apify slots"
+                )
+                return {"month": current_month, "exhausted": []}
+            return state
         except Exception:
             logger.warning(f"Could not parse {STATE_FILE}, treating as empty")
-    return {"exhausted": []}
+    return {"month": _current_month(), "exhausted": []}
 
 
 def _save_state(state: dict) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    state.setdefault("month", _current_month())
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
