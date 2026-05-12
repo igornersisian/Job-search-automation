@@ -20,7 +20,7 @@ from datetime import datetime, time as dt_time, timezone
 
 import httpx
 from openai import OpenAI
-from supabase import create_client, Client
+from supabase import create_client, Client, ClientOptions
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -65,6 +65,7 @@ def get_supabase() -> Client:
         _supabase = create_client(
             os.environ["SUPABASE_URL"],
             os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+            options=ClientOptions(postgrest_client_timeout=10),
         )
     return _supabase
 
