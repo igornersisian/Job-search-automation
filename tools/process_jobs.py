@@ -284,7 +284,7 @@ def _fetch_all_sources(keywords: list[str], profile: dict) -> tuple[list[dict], 
                 logger.info(f"{name}: {len(jobs)} jobs")
             except Exception as e:
                 logger.error(f"{name} search failed: {e}")
-                source_errors[name] = str(e)[:120]
+                source_errors[name] = str(e)
 
     # Phase 2: run ATS after the others have finished (memory freed on Apify)
     try:
@@ -293,7 +293,7 @@ def _fetch_all_sources(keywords: list[str], profile: dict) -> tuple[list[dict], 
         logger.info(f"ATS: {len(ats_jobs)} jobs")
     except Exception as e:
         logger.error(f"ATS search failed: {e}")
-        source_errors["ATS"] = str(e)[:120]
+        source_errors["ATS"] = str(e)
 
     return raw_jobs, source_errors
 

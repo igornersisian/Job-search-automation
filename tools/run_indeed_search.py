@@ -39,9 +39,7 @@ def run_actor(keyword: str) -> tuple[str, str]:
     }
     logger.info(f"Starting Indeed actor run: '{keyword}' ({apify_client.active_slot_summary()})")
     resp, token = apify_client.post(url, json_body=actor_input, timeout=30)
-    if resp.status_code >= 400:
-        logger.error(f"Indeed actor start failed ({resp.status_code}): {resp.text[:500]}")
-    resp.raise_for_status()
+    apify_client.raise_for_status_verbose(resp, f"Indeed start (input={json.dumps(actor_input, ensure_ascii=False)[:500]})")
     run_id = resp.json()["data"]["id"]
     logger.info(f"Indeed actor run started: {run_id}")
     return run_id, token
@@ -53,7 +51,7 @@ def wait_for_run(run_id: str, token: str, timeout_seconds: int = 600) -> str:
 
     while time.time() < deadline:
         resp = apify_client.get(url, token, timeout=15)
-        resp.raise_for_status()
+        apify_client.raise_for_status_verbose(resp, f"Indeed poll run={run_id}")
         data = resp.json()["data"]
         status = data["status"]
 
@@ -76,7 +74,7 @@ def fetch_dataset(dataset_id: str, token: str) -> list[dict]:
     url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
     logger.info(f"Downloading Indeed dataset {dataset_id}...")
     resp = apify_client.get(url, token, params={"format": "json", "clean": "true"}, timeout=60)
-    resp.raise_for_status()
+    apify_client.raise_for_status_verbose(resp, f"Indeed dataset={dataset_id}")
     items = resp.json()
     logger.info(f"Downloaded {len(items)} Indeed jobs")
     return items

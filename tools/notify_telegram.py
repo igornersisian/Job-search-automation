@@ -129,6 +129,23 @@ def send_job_card(job: dict) -> bool:
         return False
 
 
+_TG_LIMIT = 4000  # Telegram caps messages at 4096 chars; keep a small buffer
+
+
+def _send_chunked(text: str, parse_mode: str | None = None) -> None:
+    """Send a (possibly very long) plain-text payload, splitting on line/char
+    boundaries so Telegram never rejects it for length."""
+    while text:
+        chunk = text[:_TG_LIMIT]
+        if len(text) > _TG_LIMIT:
+            # try to break on a newline so error blocks stay readable
+            cut = chunk.rfind("\n")
+            if cut > _TG_LIMIT // 2:
+                chunk = chunk[:cut]
+        send_message(chunk, parse_mode=parse_mode)
+        text = text[len(chunk):].lstrip("\n")
+
+
 def send_daily_summary(
     sent: int,
     skipped_score: int,
@@ -140,7 +157,13 @@ def send_daily_summary(
     dupes_fuzzy: int = 0,
     source_errors: dict | None = None,
 ) -> None:
-    """Send a brief daily pipeline summary."""
+    """Send a brief daily pipeline summary.
+
+    The summary itself uses Markdown. Source errors are sent as separate
+    plain-text follow-up messages so response bodies (which often contain
+    `_`, `*`, `[` that break Markdown) survive intact and the full error
+    is preserved instead of being truncated.
+    """
     dupe_detail = ""
     if skipped_dupe:
         parts = []
@@ -160,12 +183,20 @@ def send_daily_summary(
         f"♻️ Duplicates skipped: {skipped_dupe}{dupe_detail}"
     )
     if source_errors:
-        error_lines = "\n".join(f"• {k}: {v}" for k, v in source_errors.items())
-        text += f"\n\n⚠️ *Failed sources ({len(source_errors)}):*\n{error_lines}"
+        text += f"\n\n⚠️ Failed sources: {len(source_errors)} — details below"
     try:
         send_message(text)
     except Exception as e:
         logger.error(f"Failed to send summary: {e}")
+
+    # Send each error as its own plain-text message so we never truncate and
+    # never lose response bodies to Markdown parse errors.
+    if source_errors:
+        for name, err in source_errors.items():
+            try:
+                _send_chunked(f"⚠️ {name} failed:\n\n{err}", parse_mode=None)
+            except Exception as e:
+                logger.error(f"Failed to send error detail for {name}: {e}")
 
 
 if __name__ == "__main__":

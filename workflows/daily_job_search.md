@@ -61,6 +61,14 @@ All 6 scrapers run **in parallel** via `ThreadPoolExecutor`:
 
 Wellfound doesn't support free-text search — it uses fixed role-category URLs like `wellfound.com/role/r/automation-engineer`. The pipeline converts `search_keywords` to URL slugs automatically (`_keyword_to_slug()`), but many keywords won't map to real Wellfound categories and will simply return 0 results. This is harmless (no errors, no wasted cost beyond the actor start) but means Wellfound coverage depends on how "role-like" the keywords are. If this becomes a problem, consider a mapping layer from keywords to known Wellfound role slugs.
 
+### ATS query limit
+
+The `jobo.world/ats-jobs-search` actor caps `queries` at **5 items** — sending more returns HTTP 400 `invalid-input: Field input.queries must NOT have more than 5 items`. The pipeline passes `search_keywords[:5]` (see `run_ats_search.py`), so only the first five keywords reach this source. If you want broader ATS coverage, reorder `/keywords` to put the most important ones first, or split into multiple sequential runs.
+
+### Error reporting
+
+When any scraper fails, the daily summary lists `⚠️ Failed sources` and then sends each error as a separate plain-text Telegram message containing the full HTTP status + response body (token redacted, body capped at 1500 chars). Don't dig through server logs — copy the Telegram message back into the conversation and ask Claude to fix.
+
 ## Flow
 
 1. **Load profile** — reads parsed resume from `supabase.profile`

@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 import httpx
@@ -277,3 +278,30 @@ def active_slot_summary() -> str:
     except RuntimeError as e:
         return f"NO ACTIVE TOKEN: {e}"
     return f"slot {idx + 1}/{len(_load_tokens())} (...{_fingerprint(tok)})"
+
+
+_TOKEN_PARAM_RE = re.compile(r"(token=)[^&\s'\"]+")
+
+
+def _redact(text: str) -> str:
+    """Strip Apify tokens from any string (URLs, response bodies, etc.)."""
+    return _TOKEN_PARAM_RE.sub(r"\1<redacted>", text or "")
+
+
+def raise_for_status_verbose(resp: httpx.Response, label: str) -> None:
+    """Like resp.raise_for_status() but the exception message carries the
+    response status, reason, and body — so callers (and Telegram error
+    summaries) can see *why* a request failed, not just the URL.
+
+    The Apify token is redacted from the body/URL before inclusion.
+    """
+    if resp.status_code < 400:
+        return
+    body = _redact((resp.text or "").strip())
+    max_body = 1500
+    if len(body) > max_body:
+        body = body[:max_body] + f"... (truncated, {len(body)} chars total)"
+    raise RuntimeError(
+        f"{label}: HTTP {resp.status_code} {resp.reason_phrase or ''} | "
+        f"body: {body or '<empty>'}"
+    )
