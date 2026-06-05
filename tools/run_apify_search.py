@@ -27,6 +27,17 @@ ACTOR_ID = "2rJKkhh7vjpX7pvjg"  # cheap_scraper/linkedin-job-scraper
 MAX_ITEMS = 150                 # our cap → also the truncation threshold
 
 
+def _published_at(lookback: int) -> str:
+    """LinkedIn's publishedAt is an ENUM ('', r86400, r604800, r2592000) — it
+    rejects arbitrary seconds (HTTP 400). Snap lookback up to the nearest
+    allowed bucket. So LinkedIn effectively can't go below 24h."""
+    if lookback <= 86400:
+        return "r86400"      # last 24 hours (minimum granularity)
+    if lookback <= 604800:
+        return "r604800"     # last 7 days
+    return "r2592000"        # last 30 days
+
+
 def normalise_linkedin(raw: dict) -> dict:
     """Map cheap_scraper/linkedin-job-scraper output to the shared job schema."""
     salary_info = raw.get("salaryInfo") or []
@@ -50,7 +61,7 @@ def fetch(keywords: list[str], *, lookback: int = 86400) -> apify_client.SourceR
     """Run the LinkedIn actor for the given keywords over the lookback window."""
     actor_input = {
         "keyword": keywords,
-        "publishedAt": f"r{lookback}",   # relative seconds, e.g. r25200 = last 7h
+        "publishedAt": _published_at(lookback),   # enum-only; 24h minimum
         "workType": ["remote"],
         "maxItems": MAX_ITEMS,
         "saveOnlyUniqueItems": True,

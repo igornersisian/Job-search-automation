@@ -18,6 +18,7 @@ Usage:
 import os
 import sys
 import json
+import time
 import logging
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -181,7 +182,7 @@ def get_supabase() -> Client:
         _supabase = create_client(
             os.environ["SUPABASE_URL"],
             os.environ["SUPABASE_SERVICE_ROLE_KEY"],
-            options=ClientOptions(postgrest_client_timeout=10),
+            options=ClientOptions(postgrest_client_timeout=30),
         )
     return _supabase
 
@@ -269,10 +270,26 @@ def _upsert_rows(rows: list[dict]) -> None:
         _upsert_rows(rows)  # retry; may drop another missing column
 
 
-def save_jobs_batch(rows: list[dict], chunk_size: int = 100) -> None:
-    """Batch-upsert job rows in chunks (replaces hundreds of per-job round-trips)."""
+def save_jobs_batch(rows: list[dict], chunk_size: int = 25) -> None:
+    """Batch-upsert job rows in chunks (replaces hundreds of per-job round-trips).
+
+    Smaller chunks + per-chunk retry keep large writes under the client timeout
+    on a flaky/remote DB connection. Raises only if a chunk still fails after
+    retries (caller treats persistence failure as non-fatal)."""
     for i in range(0, len(rows), chunk_size):
-        _upsert_rows(rows[i : i + chunk_size])
+        chunk = rows[i : i + chunk_size]
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                _upsert_rows(chunk)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning(f"Batch upsert chunk {i // chunk_size} attempt {attempt + 1} failed: {e}")
+                time.sleep(2 * (attempt + 1))
+        if last_err is not None:
+            raise last_err
 
 
 def save_job(job: dict, status: str) -> None:
@@ -640,8 +657,15 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
                     errors += 1
                     errors_log.append({"source": base, "stage": status, "message": f"{job.get('title','')[:80]}"})
 
-        # batch-save everything at once (was hundreds of per-job upserts)
-        save_jobs_batch(rows_to_save)
+        # batch-save everything at once (was hundreds of per-job upserts).
+        # Persistence failure is non-fatal: cards were already sent, and the run
+        # outcome is still recorded in pipeline_runs below.
+        try:
+            save_jobs_batch(rows_to_save)
+        except Exception as e:
+            logger.error(f"Batch save failed (continuing): {e}")
+            errors_log.append({"source": "supabase", "stage": "save_jobs", "message": str(e)[:300]})
+            ok = False
 
         totals = {
             "fetched": sum(p["fetched"] for p in per_source.values()),

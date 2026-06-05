@@ -45,9 +45,10 @@ day. Registered as one `job_queue.run_daily` per slot in `telegram_bot.py`
 Manual run: `python tools/process_jobs.py [--lookback SECONDS] [--slot HH:MM]`.
 
 Search window: `LOOKBACK_SECONDS` env (default 25200 = 7h = 6h interval + 1h
-buffer). Only LinkedIn (`publishedAt=r{LOOKBACK}`) and ATS (`posted_after`)
-actually narrow with it — Indeed/Glassdoor stay 24h (actor minimum), dedup
-removes the slot overlap. Wellfound runs only in the 09:00 slot (low yield).
+buffer). **Only ATS actually narrows** with it (`posted_after` timestamp).
+LinkedIn `publishedAt` is an enum (24h minimum), Indeed/Glassdoor are
+day-granularity — all three stay 24h regardless; cross-run dedup removes the
+slot overlap. Wellfound runs only in the 09:00 slot (low yield).
 
 ## Sources
 
