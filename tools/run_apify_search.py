@@ -1,15 +1,14 @@
 """
-Trigger Apify LinkedIn Jobs Scraper and return normalised job list.
+LinkedIn jobs via Apify, on the shared runner.
 
-Actor: cheap_scraper/linkedin-job-scraper
-Docs:  https://console.apify.com/actors/2rJKkhh7vjpX7pvjg
+Actor: cheap_scraper/linkedin-job-scraper (id 2rJKkhh7vjpX7pvjg)
+Pricing: pay-per-result (~$0.70/1000 free tier) — narrows with the lookback window.
 
-Usage:
-    python tools/run_apify_search.py
+Exposes `fetch(keywords, *, lookback)` -> apify_client.SourceResult.
+The start/poll/fetch/retry/cap/cost lifecycle lives in apify_client.run_actor_job.
 """
 
 import json
-import time
 import logging
 
 from dotenv import load_dotenv
@@ -25,64 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ACTOR_ID = "2rJKkhh7vjpX7pvjg"  # cheap_scraper/linkedin-job-scraper
-
-
-def run_actor(keywords: list[str]) -> tuple[str, str]:
-    """Start the Apify actor run. Returns (run_id, token_used)."""
-    url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
-    actor_input = {
-        "keyword": keywords,
-        "publishedAt": "r86400",          # last 24 hours
-        "workType": ["remote"],
-        "maxItems": 150,
-        "saveOnlyUniqueItems": True,
-    }
-
-    logger.info(f"Starting LinkedIn actor run with {len(keywords)} keywords ({apify_client.active_slot_summary()})...")
-    resp, token = apify_client.post(url, json_body=actor_input, timeout=30)
-    apify_client.raise_for_status_verbose(resp, f"LinkedIn start (input={json.dumps(actor_input, ensure_ascii=False)[:500]})")
-
-    run_id = resp.json()["data"]["id"]
-    logger.info(f"LinkedIn actor run started: {run_id}")
-    return run_id, token
-
-
-def wait_for_run(run_id: str, token: str, timeout_seconds: int = 600) -> str:
-    """Poll until the run is SUCCEEDED, return dataset_id."""
-    url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    deadline = time.time() + timeout_seconds
-
-    while time.time() < deadline:
-        resp = apify_client.get(url, token, timeout=15)
-        apify_client.raise_for_status_verbose(resp, f"LinkedIn poll run={run_id}")
-        data = resp.json()["data"]
-        status = data["status"]
-
-        if status == "SUCCEEDED":
-            dataset_id = data["defaultDatasetId"]
-            logger.info(f"LinkedIn run succeeded. Dataset: {dataset_id}")
-            return dataset_id
-        elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
-            status_msg = data.get("statusMessage") or ""
-            apify_client.report_run_failure(token, status, status_msg)
-            raise RuntimeError(f"LinkedIn actor run {run_id} ended with status: {status} ({status_msg[:200]})")
-
-        logger.info(f"LinkedIn run status: {status}. Waiting...")
-        time.sleep(10)
-
-    raise TimeoutError(f"LinkedIn actor run {run_id} did not finish within {timeout_seconds}s")
-
-
-def fetch_dataset(dataset_id: str, token: str) -> list[dict]:
-    """Download all items from an Apify dataset."""
-    url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-    logger.info(f"Downloading LinkedIn dataset {dataset_id}...")
-    resp = apify_client.get(url, token, params={"format": "json", "clean": "true"}, timeout=60)
-    apify_client.raise_for_status_verbose(resp, f"LinkedIn dataset={dataset_id}")
-
-    items = resp.json()
-    logger.info(f"Downloaded {len(items)} LinkedIn jobs")
-    return items
+MAX_ITEMS = 150                 # our cap → also the truncation threshold
 
 
 def normalise_linkedin(raw: dict) -> dict:
@@ -104,15 +46,22 @@ def normalise_linkedin(raw: dict) -> dict:
     }
 
 
-def run_search(keywords: list[str]) -> list[dict]:
-    """Full flow: trigger -> wait -> fetch -> normalise. Returns list of job dicts."""
-    run_id, token = run_actor(keywords)
-    dataset_id = wait_for_run(run_id, token)
-    raw_items = fetch_dataset(dataset_id, token)
-    return [normalise_linkedin(item) for item in raw_items]
+def fetch(keywords: list[str], *, lookback: int = 86400) -> apify_client.SourceResult:
+    """Run the LinkedIn actor for the given keywords over the lookback window."""
+    actor_input = {
+        "keyword": keywords,
+        "publishedAt": f"r{lookback}",   # relative seconds, e.g. r25200 = last 7h
+        "workType": ["remote"],
+        "maxItems": MAX_ITEMS,
+        "saveOnlyUniqueItems": True,
+    }
+    return apify_client.run_actor_job(
+        ACTOR_ID, actor_input,
+        source="linkedin", normalise=normalise_linkedin, cap=MAX_ITEMS,
+    )
 
 
 if __name__ == "__main__":
-    jobs = run_search()
-    print(json.dumps(jobs, ensure_ascii=False, indent=2))
-    logger.info(f"Done. {len(jobs)} LinkedIn jobs fetched.")
+    r = fetch(["automation engineer", "AI engineer"], lookback=86400)
+    print(json.dumps(r.items, ensure_ascii=False, indent=2))
+    logger.info(f"Done. {len(r.items)} LinkedIn jobs, ${r.cost_usd:.4f}, capped={r.capped}, error={r.error}")

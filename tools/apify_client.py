@@ -24,7 +24,10 @@ import json
 import logging
 import os
 import re
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import httpx
 from dotenv import load_dotenv
@@ -305,3 +308,178 @@ def raise_for_status_verbose(resp: httpx.Response, label: str) -> None:
         f"{label}: HTTP {resp.status_code} {resp.reason_phrase or ''} | "
         f"body: {body or '<empty>'}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Unified actor runner — single place for token rotation, retry-on-credit,
+# cap-check, cost capture, error capture and timing. Every scraper calls this
+# instead of copy-pasting the start/poll/fetch lifecycle.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SourceResult:
+    """Outcome of one Apify actor job, used uniformly by the pipeline.
+
+    Never carries an exception — operational failures land in `error` so the
+    pipeline keeps going and the failure is logged/persisted in one place.
+    """
+    source: str
+    items: list[dict] = field(default_factory=list)   # normalised job dicts
+    fetched: int = 0                                   # raw items before normalise
+    cost_usd: float = 0.0                              # Apify usageTotalUsd
+    capped: bool = False                               # fetched hit the requested cap
+    error: str | None = None
+    attempts: int = 0
+    ms: int = 0
+
+
+def run_actor_job(
+    actor_id: str,
+    actor_input: dict,
+    *,
+    source: str,
+    normalise: Callable[[dict], dict],
+    cap: int | None = None,
+    timeout_seconds: int = 600,
+    poll_interval: int = 10,
+) -> SourceResult:
+    """Run one Apify actor end-to-end. Returns SourceResult (never raises for
+    operational failures).
+
+    Handles, in one place:
+      - token rotation on start-credit errors (via post())
+      - retry on the NEXT token when a *started* run dies with a credit-related
+        FAILED/ABORTED (the run can't be resumed cross-account, so we restart
+        the whole cycle for this one source)
+      - cap-check: capped = fetched >= cap (signals possible truncation)
+      - cost capture from the run's usageTotalUsd
+      - error + timing capture
+    """
+    started = time.perf_counter()
+    res = SourceResult(source=source)
+    runs_url = f"https://api.apify.com/v2/acts/{actor_id}/runs"
+    max_attempts = max(1, len(_load_tokens()))
+
+    for attempt in range(1, max_attempts + 1):
+        res.attempts = attempt
+
+        # ---- start (post() rotates internally on start-credit errors) ----
+        try:
+            resp, token = post(runs_url, json_body=actor_input, timeout=30)
+        except Exception as e:  # network/all-exhausted
+            res.error = f"start failed: {e}"
+            break
+        if resp.status_code >= 400:
+            res.error = f"start HTTP {resp.status_code}: {_redact((resp.text or '')[:400])}"
+            break
+        try:
+            run_id = resp.json()["data"]["id"]
+        except Exception as e:
+            res.error = f"bad start response: {e}"
+            break
+
+        # ---- poll ----
+        run_url = f"https://api.apify.com/v2/actor-runs/{run_id}"
+        deadline = time.time() + timeout_seconds
+        status: str | None = None
+        run_data: dict = {}
+        poll_error: str | None = None
+        while time.time() < deadline:
+            try:
+                pr = get(run_url, token, timeout=15)
+            except Exception as e:
+                poll_error = f"poll error: {e}"
+                break
+            if pr.status_code >= 400:
+                poll_error = f"poll HTTP {pr.status_code}: {_redact((pr.text or '')[:300])}"
+                break
+            run_data = pr.json()["data"]
+            status = run_data.get("status")
+            if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
+                break
+            time.sleep(poll_interval)
+
+        if poll_error:
+            res.error = poll_error
+            break
+
+        # ---- success ----
+        if status == "SUCCEEDED":
+            res.cost_usd = float(run_data.get("usageTotalUsd") or 0.0)
+            dataset_id = run_data.get("defaultDatasetId")
+            try:
+                ds = get(
+                    f"https://api.apify.com/v2/datasets/{dataset_id}/items",
+                    token, params={"format": "json", "clean": "true"}, timeout=60,
+                )
+            except Exception as e:
+                res.error = f"dataset fetch failed: {e}"
+                break
+            if ds.status_code >= 400:
+                res.error = f"dataset HTTP {ds.status_code}: {_redact((ds.text or '')[:300])}"
+                break
+            raw = ds.json()
+            res.fetched = len(raw)
+            res.capped = cap is not None and len(raw) >= cap
+            if res.capped:
+                logger.warning(f"[{source}] hit cap {cap} (fetched {len(raw)}) — possible truncation")
+            out: list[dict] = []
+            for item in raw:
+                try:
+                    out.append(normalise(item))
+                except Exception as e:
+                    logger.warning(f"[{source}] normalise failed for one item: {e}")
+            res.items = out
+            res.error = None
+            logger.info(
+                f"[{source}] ok: {len(out)} jobs, ${res.cost_usd:.4f}, "
+                f"capped={res.capped}, attempt {attempt}/{max_attempts}"
+            )
+            break
+
+        # ---- terminal non-success (FAILED/ABORTED/TIMED-OUT) ----
+        status_msg = run_data.get("statusMessage") or ""
+        report_run_failure(token, status or "", status_msg)
+        if looks_like_credit_failure_message(status_msg) and attempt < max_attempts:
+            logger.warning(
+                f"[{source}] credit-fail mid-run on slot {_fingerprint(token)} "
+                f"(attempt {attempt}) — retrying on next token"
+            )
+            res.error = f"run {status} (credit): {status_msg[:200]}"
+            continue  # restart whole cycle on next token
+        res.error = f"run {status}: {status_msg[:300]}" if status else "no terminal status (timeout)"
+        break
+
+    res.ms = int((time.perf_counter() - started) * 1000)
+    if res.error:
+        logger.error(f"[{source}] FAILED after {res.attempts} attempt(s): {res.error}")
+    return res
+
+
+def merge_results(source: str, results: list[SourceResult]) -> SourceResult:
+    """Aggregate several SourceResults (e.g. per-keyword runs) into one.
+
+    Items are de-duplicated by id; cost/fetched summed; capped OR-ed; errors
+    joined. Used by per-keyword sources (Indeed, Glassdoor) that fan out into
+    one actor run per keyword.
+    """
+    merged = SourceResult(source=source)
+    seen: set[str] = set()
+    errors: list[str] = []
+    for r in results:
+        merged.fetched += r.fetched
+        merged.cost_usd += r.cost_usd
+        merged.capped = merged.capped or r.capped
+        merged.attempts = max(merged.attempts, r.attempts)
+        merged.ms = max(merged.ms, r.ms)
+        if r.error:
+            errors.append(r.error)
+        for item in r.items:
+            jid = item.get("id")
+            if jid and jid in seen:
+                continue
+            if jid:
+                seen.add(jid)
+            merged.items.append(item)
+    merged.error = "; ".join(errors) if errors else None
+    return merged

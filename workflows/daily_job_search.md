@@ -39,12 +39,25 @@ create table if not exists jobs (
 ```
 
 ## Trigger
-Cron: `0 9 * * 1-5` (Mon-Fri 9:00 UTC)
-Command: `python tools/process_jobs.py`
+**4×/day** at 03:00 / 09:00 / 15:00 / 21:00 UTC (= 10/16/22/04 GMT+7), every
+day. Registered as one `job_queue.run_daily` per slot in `telegram_bot.py`
+(`scheduled_pipeline`), with the slot label passed via `data`.
+Manual run: `python tools/process_jobs.py [--lookback SECONDS] [--slot HH:MM]`.
+
+Search window: `LOOKBACK_SECONDS` env (default 25200 = 7h = 6h interval + 1h
+buffer). Only LinkedIn (`publishedAt=r{LOOKBACK}`) and ATS (`posted_after`)
+actually narrow with it — Indeed/Glassdoor stay 24h (actor minimum), dedup
+removes the slot overlap. Wellfound runs only in the 09:00 slot (low yield).
 
 ## Sources
 
-All 6 scrapers run **in parallel** via `ThreadPoolExecutor`:
+All scrapers run on the **unified runner** `apify_client.run_actor_job(...)`,
+which handles token rotation, retry-on-credit (per source, on the next token),
+the cap-check, `usageTotalUsd` capture and error capture in ONE place. Each
+`run_*_search.py` just provides `actor_id` + input builder + `normalise` and
+returns a `SourceResult`. The lightweight scrapers run in parallel; ATS runs
+after them (Apify per-account memory cap). Indeed/Glassdoor fan out per keyword
+in parallel internally.
 
 | # | Source | Script | Apify Actor | Platforms | Price/1000 |
 |---|--------|--------|-------------|-----------|------------|
@@ -85,11 +98,12 @@ When any scraper fails, the daily summary lists `⚠️ Failed sources` and then
    - Junior/intern filter: skips based on title/description keywords
 
 4. **Phase 2: Score + Enrich + Notify** (parallel, 5 workers)
-   - `quick_score()` — fast OpenAI scoring (0-100)
-   - If score < threshold (default 70) → save as `low_score`, skip
-   - `score_job()` — enrichment: match_summary, red_flags
-   - `send_job_card()` → Telegram notification
-   - Save to Supabase
+   - `quick_score()` → `score_job()` — a **single** `gpt-5-mini` call per
+     candidate that writes match_summary + red_flags, then sub-scores (0-100)
+   - If score < threshold (default 70) → `low_score`, skip
+   - `send_job_card()` → Telegram notification for qualifying jobs
+   - All rows (excluded/low_score/sent/...) are **batch-upserted** to Supabase
+     once at the end, not per-job
 
 5. **Daily summary** — sends stats to Telegram
 
@@ -103,7 +117,19 @@ When any scraper fails, the daily summary lists `⚠️ Failed sources` and then
 - **No new jobs found**: pipeline completes, sends summary with 0 sent
 - **Single source fails**: other sources continue, error logged
 
-## Cost Estimate (per run)
-- Apify scrapers: ~$0.30-0.50/run (ATS + RemoteBoards are cheapest)
-- OpenAI scoring: ~60 jobs × ~$0.002 = ~$0.12/day (gpt-4o-mini)
-- Total: ~$0.50/day, ~$10/month
+## Cost Estimate (real, from Apify console + DB)
+Per-source $/run (24h window): ATS ~$0.40 (per-result, narrows with window),
+LinkedIn ~$0.13 (narrows), Glassdoor ~$0.08, Indeed/RemoteBoards $0, Wellfound
+~$0.12. With 4×/day @6h windows + Wellfound 1×: **~$0.96/day ≈ ~$29/mo** Apify.
+OpenAI scoring is one `gpt-5-mini` call/candidate (~$0.002) and does NOT grow
+with frequency (cross-run dedup → each posting scored once). Actual per-run cost
+is captured from each run's `usageTotalUsd` and stored in `pipeline_runs` +
+shown in the Telegram summary — prefer those real numbers over this estimate.
+
+## Observability (always queryable)
+Every run writes one row to Supabase `pipeline_runs` (`per_source`, `totals`,
+`errors`, `ok`) — including fatal crashes (written in `run_pipeline`'s
+`finally`). Debug with:
+`select started_at, ok, totals, errors from pipeline_runs order by started_at desc limit 5;`
+The Telegram daily summary shows a per-source `fetched / new / sent ($cost)`
+breakdown + a ⚠️cap flag when a source hit its result cap (possible truncation).

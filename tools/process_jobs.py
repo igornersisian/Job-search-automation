@@ -19,7 +19,7 @@ import os
 import sys
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from supabase import create_client, Client, ClientOptions
@@ -27,14 +27,23 @@ from dotenv import load_dotenv
 
 # Import sibling tools
 sys.path.insert(0, os.path.dirname(__file__))
-from run_apify_search import run_search as run_linkedin_search
-from run_glassdoor_search import run_search as run_glassdoor_search
-from run_indeed_search import run_search as run_indeed_search
-from run_wellfound_search import run_search as run_wellfound_search
-from run_remoteboards_search import run_search as run_remoteboards_search
-from run_ats_search import run_search as run_ats_search
+import traceback
+
+import apify_client
+from apify_client import SourceResult
+import run_apify_search
+import run_glassdoor_search
+import run_indeed_search
+import run_wellfound_search
+import run_remoteboards_search
+import run_ats_search
 from score_job import quick_score, is_excluded_by_title
 from notify_telegram import send_job_card, send_daily_summary, send_message
+
+# Wellfound runs only in this UTC slot (low yield; see plan). None/other slots skip it.
+WELLFOUND_SLOT = "09:00"
+# How far back the cross-run fuzzy dedup looks for an already-seen posting.
+CROSSRUN_DEDUP_DAYS = 4
 
 load_dotenv()
 
@@ -103,8 +112,9 @@ def _normalise_title(title: str) -> str:
     if not title:
         return ""
     t = title.lower().strip()
-    # Remove common punctuation noise
-    t = t.replace("-", " ").replace("–", " ").replace("/", " ")
+    # Remove common punctuation noise. Commas and pipes are also stripped so the
+    # fingerprint (norm_title|norm_company) is safe inside a PostgREST in.() list.
+    t = t.replace("-", " ").replace("–", " ").replace("/", " ").replace(",", " ").replace("|", " ")
     # Replace abbreviations with full forms
     words = t.split()
     words = [_TITLE_SYNONYMS.get(w, w) for w in words]
@@ -123,8 +133,9 @@ def _normalise_company(company: str) -> str:
         if c.endswith(suffix):
             c = c[: -len(suffix)].strip()
             break
-    # Remove trailing punctuation
-    c = c.rstrip(".,")
+    # Remove trailing punctuation; strip commas/pipes so the fingerprint is safe
+    # inside a PostgREST in.() list.
+    c = c.rstrip(".,").replace(",", " ").replace("|", " ")
     # Strip trade descriptors from the tail ("ninetwothree ai studio" → "ninetwothree").
     # Guard: never collapse to a stem shorter than 3 chars — preserves short real names.
     words = c.split()
@@ -199,9 +210,23 @@ def fetch_existing_ids(job_ids: list[str]) -> set[str]:
     return existing
 
 
-def save_job(job: dict, status: str) -> None:
-    """Insert job record into Supabase."""
-    row = {
+def _base_source(source: str) -> str:
+    """Collapse 'ats-greenhouse' / 'remoteboards-remoteok' to the base bucket."""
+    s = (source or "").lower()
+    for b in ("linkedin", "glassdoor", "indeed", "wellfound", "ats", "remoteboards"):
+        if s.startswith(b):
+            return b
+    return s.split("-")[0] or "unknown"
+
+
+def _fingerprint(job: dict) -> str:
+    """Cross-run dedup key: normalised title|company (same as in-run dedup_key)."""
+    return f"{_normalise_title(job.get('title', ''))}|{_normalise_company(job.get('company', ''))}"
+
+
+def _job_row(job: dict, status: str) -> dict:
+    """Build a Supabase `jobs` row from a job dict."""
+    return {
         "id": job.get("id") or job.get("jobId") or job.get("url", "")[:200],
         "source": job.get("source", "linkedin"),
         "title": job.get("title", ""),
@@ -215,19 +240,84 @@ def save_job(job: dict, status: str) -> None:
         "match_summary": job.get("match_summary", ""),
         "red_flags": json.dumps(job.get("red_flags", [])),
         "score_breakdown": json.dumps(job.get("score_breakdown", {})),
+        "fingerprint": _fingerprint(job),
         "typical_qa": "[]",
         "status": status,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _upsert_rows(rows: list[dict]) -> None:
+    """Upsert a batch, retrying without optional columns the DB may not have."""
+    if not rows:
+        return
     try:
-        get_supabase().table("jobs").upsert(row).execute()
+        get_supabase().table("jobs").upsert(rows).execute()
+        return
     except Exception as e:
-        if "score_breakdown" in str(e):
-            logger.warning("score_breakdown column missing — saving without it")
-            row.pop("score_breakdown", None)
-            get_supabase().table("jobs").upsert(row).execute()
-        else:
+        msg = str(e)
+        dropped = None
+        for col in ("fingerprint", "score_breakdown"):
+            if col in msg:
+                dropped = col
+                break
+        if not dropped:
             raise
+        logger.warning(f"'{dropped}' column missing — saving batch without it")
+        for r in rows:
+            r.pop(dropped, None)
+        _upsert_rows(rows)  # retry; may drop another missing column
+
+
+def save_jobs_batch(rows: list[dict], chunk_size: int = 100) -> None:
+    """Batch-upsert job rows in chunks (replaces hundreds of per-job round-trips)."""
+    for i in range(0, len(rows), chunk_size):
+        _upsert_rows(rows[i : i + chunk_size])
+
+
+def save_job(job: dict, status: str) -> None:
+    """Single-row convenience wrapper around the batch saver."""
+    save_jobs_batch([_job_row(job, status)])
+
+
+def fetch_recent_fingerprints(fingerprints: list[str], days: int = CROSSRUN_DEDUP_DAYS) -> dict[str, list[str]]:
+    """For cross-run fuzzy dedup: map each given fingerprint to descriptions of
+    recently-saved jobs that share it. Empty if the `fingerprint` column does
+    not exist yet (migration not run) — degrades to exact-id dedup only.
+    """
+    out: dict[str, list[str]] = {}
+    fps = [f for f in {fp for fp in fingerprints} if f and f != "|"]
+    if not fps:
+        return out
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    chunk_size = 100
+    try:
+        for i in range(0, len(fps), chunk_size):
+            chunk = fps[i : i + chunk_size]
+            res = (
+                get_supabase().table("jobs")
+                .select("fingerprint,description")
+                .in_("fingerprint", chunk)
+                .gte("created_at", cutoff)
+                .execute()
+            )
+            for row in res.data:
+                fp = row.get("fingerprint")
+                if fp:
+                    out.setdefault(fp, []).append(row.get("description") or "")
+    except Exception as e:
+        logger.warning(f"Cross-run fingerprint lookup skipped ({e}) — exact-id dedup only")
+        return {}
+    return out
+
+
+def save_pipeline_run(row: dict) -> None:
+    """Persist a pipeline_runs audit row. Never raises (observability must not
+    break the pipeline); logs if the table is missing."""
+    try:
+        get_supabase().table("pipeline_runs").insert(row).execute()
+    except Exception as e:
+        logger.warning(f"Could not write pipeline_runs ({e}) — run migration 001 to enable audit log")
 
 
 # ---------------------------------------------------------------------------
@@ -261,50 +351,51 @@ def normalise_job(raw: dict) -> dict:
 # Parallel scraper fetch
 # ---------------------------------------------------------------------------
 
-def _fetch_all_sources(keywords: list[str], profile: dict) -> tuple[list[dict], dict[str, str]]:
-    """Run all scrapers and return (merged job list, source errors).
+def _fetch_all_sources(
+    keywords: list[str], profile: dict, lookback: int, run_wellfound: bool,
+) -> tuple[list[dict], dict[str, SourceResult]]:
+    """Run all scrapers and return (merged job list, per-source SourceResults).
 
-    The 5 lightweight scrapers run in parallel first. ATS runs after they have
-    started (their Apify actors are RUNNING) so it doesn't compete for the
-    8192 MB per-account memory cap. ATS alone needs 4096 MB; the other 5
-    together need ~5760 MB, so all 6 simultaneous would exceed the limit.
+    The lightweight scrapers run in parallel first. ATS runs after them so it
+    doesn't compete for the 8192 MB per-account memory cap (ATS alone needs
+    4096 MB; the others together ~5760 MB → all simultaneous would exceed it).
+    Each scraper returns a SourceResult (never raises); the runner handles
+    retries/cost/cap/errors uniformly.
     """
-    raw_jobs: list[dict] = []
-    source_errors: dict[str, str] = {}
+    results: dict[str, SourceResult] = {}
 
-    # Phase 1: start the 5 lightweight scrapers in parallel
+    def _safe(name, fn):
+        try:
+            return fn()
+        except Exception as e:  # defensive — runner shouldn't raise
+            logger.error(f"{name} unexpected error: {e}")
+            return SourceResult(source=name, error=f"unexpected: {e}")
+
+    # Phase 1: lightweight scrapers in parallel
     with ThreadPoolExecutor(max_workers=5) as executor:
-        future_linkedin = executor.submit(run_linkedin_search, keywords)
-        future_glassdoor = executor.submit(run_glassdoor_search, keywords)
-        future_indeed = executor.submit(run_indeed_search, keywords)
-        future_wellfound = executor.submit(run_wellfound_search, keywords, profile)
-        future_remoteboards = executor.submit(run_remoteboards_search, keywords)
+        futures = {
+            "linkedin": executor.submit(_safe, "linkedin", lambda: run_apify_search.fetch(keywords, lookback=lookback)),
+            "glassdoor": executor.submit(_safe, "glassdoor", lambda: run_glassdoor_search.fetch(keywords, lookback=lookback)),
+            "indeed": executor.submit(_safe, "indeed", lambda: run_indeed_search.fetch(keywords, lookback=lookback)),
+            "remoteboards": executor.submit(_safe, "remoteboards", lambda: run_remoteboards_search.fetch(keywords, lookback=lookback, profile=profile)),
+        }
+        if run_wellfound:
+            futures["wellfound"] = executor.submit(_safe, "wellfound", lambda: run_wellfound_search.fetch(keywords, lookback=lookback, profile=profile))
+        for name, fut in futures.items():
+            results[name] = fut.result()
 
-        for name, future in [
-            ("LinkedIn", future_linkedin),
-            ("Glassdoor", future_glassdoor),
-            ("Indeed", future_indeed),
-            ("Wellfound", future_wellfound),
-            ("RemoteBoards", future_remoteboards),
-        ]:
-            try:
-                jobs = future.result()
-                raw_jobs.extend(jobs)
-                logger.info(f"{name}: {len(jobs)} jobs")
-            except Exception as e:
-                logger.error(f"{name} search failed: {e}")
-                source_errors[name] = str(e)
+    if not run_wellfound:
+        logger.info(f"Wellfound skipped this slot (runs only in {WELLFOUND_SLOT} UTC)")
 
-    # Phase 2: run ATS after the others have finished (memory freed on Apify)
-    try:
-        ats_jobs = run_ats_search(keywords)
-        raw_jobs.extend(ats_jobs)
-        logger.info(f"ATS: {len(ats_jobs)} jobs")
-    except Exception as e:
-        logger.error(f"ATS search failed: {e}")
-        source_errors["ATS"] = str(e)
+    # Phase 2: ATS after the others (Apify memory freed)
+    results["ats"] = _safe("ats", lambda: run_ats_search.fetch(keywords, lookback=lookback))
 
-    return raw_jobs, source_errors
+    raw_jobs: list[dict] = []
+    for name, r in results.items():
+        raw_jobs.extend(r.items)
+        logger.info(f"{name}: {len(r.items)} jobs, ${r.cost_usd:.4f}, capped={r.capped}, error={r.error}")
+
+    return raw_jobs, results
 
 
 # ---------------------------------------------------------------------------
@@ -341,202 +432,267 @@ def _process_single_job(job: dict, profile: dict, threshold: int) -> tuple[dict,
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run_pipeline() -> None:
-    logger.info("=== Daily job search pipeline started ===")
+def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
+    """Run the full pipeline for one slot.
 
-    # Load profile
-    try:
-        profile = get_profile()
-    except Exception as e:
-        msg = f"⚠️ Pipeline failed — cannot reach Supabase: {e}\n\nYour Supabase project may be paused (free tier auto-pauses after 1 week). Resume it at supabase.com/dashboard."
-        logger.error(msg)
+    lookback: search window in seconds (default from LOOKBACK_SECONDS env, ~7h).
+    slot: '03:00'/'09:00'/... — controls low-yield Wellfound (runs only in
+          WELLFOUND_SLOT). None = manual run (Wellfound included).
+
+    Every outcome — including a fatal crash — is persisted to `pipeline_runs`
+    in Supabase via the `finally` block, so errors are always queryable.
+    """
+    started_at = datetime.now(timezone.utc)
+    if lookback is None:
         try:
-            from notify_telegram import send_message
+            lookback = int(os.environ.get("LOOKBACK_SECONDS", "25200"))  # 7h default
+        except ValueError:
+            lookback = 25200
+    run_wellfound = slot in (None, WELLFOUND_SLOT)
+    logger.info(f"=== Pipeline started (slot={slot}, lookback={lookback}s, wellfound={run_wellfound}) ===")
+
+    per_source: dict[str, dict] = {}
+    errors_log: list[dict] = []
+    totals: dict = {}
+    keywords_used: list | None = None
+    ok = True
+
+    try:
+        # Load profile
+        try:
+            profile = get_profile()
+        except Exception as e:
+            errors_log.append({"source": "supabase", "stage": "load_profile", "message": str(e)[:500]})
+            ok = False
+            msg = f"⚠️ Pipeline failed — cannot reach Supabase: {e}\n\nResume the DB if paused."
+            logger.error(msg)
+            try:
+                send_message(msg, parse_mode=None)
+            except Exception:
+                pass
+            raise
+        if not profile:
+            logger.error("No resume profile in Supabase. Send PDF to Telegram bot first.")
+            errors_log.append({"source": "pipeline", "stage": "profile", "message": "no profile"})
+            ok = False
+            return
+
+        threshold = profile.get("score_threshold") or DEFAULT_SCORE_THRESHOLD
+        logger.info(f"Score threshold: {threshold}%")
+
+        keywords = profile.get("search_keywords")
+        if not keywords:
+            logger.error("No search keywords set. Use /keywords in the bot first.")
+            errors_log.append({"source": "pipeline", "stage": "keywords", "message": "no keywords"})
+            ok = False
+            send_message("⚠️ Pipeline skipped — no search keywords set.\nUse /keywords to add them.")
+            return
+        keywords_used = keywords
+        logger.info(f"Search keywords ({len(keywords)}): {keywords}")
+
+        excluded_title_kw = profile.get("excluded_title_keywords") or []
+        logger.info(
+            f"Excluded title keywords ({len(excluded_title_kw)}): {excluded_title_kw}"
+            if excluded_title_kw else "No excluded title keywords — title filter disabled"
+        )
+
+        # ── Phase 0: fetch from all sources ──────────────────────────
+        raw_jobs, results = _fetch_all_sources(keywords, profile, lookback, run_wellfound)
+
+        for name, r in results.items():
+            per_source[name] = {
+                "fetched": r.fetched, "new": 0, "sent": 0,
+                "cost_usd": round(r.cost_usd, 4), "capped": r.capped,
+                "error": r.error, "ms": r.ms, "attempts": r.attempts,
+            }
+            if r.error:
+                errors_log.append({"source": name, "stage": "fetch", "message": r.error[:500]})
+        total_cost = round(sum(p["cost_usd"] for p in per_source.values()), 4)
+
+        if not raw_jobs:
+            logger.error("No jobs fetched from any source.")
+            ok = len(errors_log) == 0
+            totals = {"fetched": 0, "new": 0, "sent": 0, "cost_usd": total_cost}
+            msg = "⚠️ Pipeline finished — 0 jobs fetched."
+            if errors_log:
+                msg += "\n\nErrors:\n" + "\n".join(f"• {e['source']}: {e['message'][:200]}" for e in errors_log)
             send_message(msg, parse_mode=None)
-        except Exception:
-            pass
-        raise
-    if not profile:
-        logger.error("No resume profile in Supabase. Send PDF to Telegram bot first.")
-        return
+            return
 
-    # Configurable threshold from profile (set via /threshold bot command)
-    threshold = profile.get("score_threshold") or DEFAULT_SCORE_THRESHOLD
-    logger.info(f"Score threshold: {threshold}%")
+        logger.info(f"Total raw jobs: {len(raw_jobs)}")
 
-    # Keywords must be set by user via /keywords bot command
-    keywords = profile.get("search_keywords")
-    if not keywords:
-        logger.error("No search keywords set. Use /keywords command in Telegram bot first.")
-        send_message("⚠️ Pipeline skipped — no search keywords set.\nUse /keywords to add them.")
-        return
-    logger.info(f"Search keywords ({len(keywords)}): {keywords}")
+        # ── Phase 1: dedup + title filter (no API calls) ─────────────
+        candidates: list[dict] = []
+        rows_to_save: list[dict] = []
+        skipped_excluded = 0
+        dupes_crossrun = 0        # exact id already in Supabase from previous runs
+        dupes_crossrun_fuzzy = 0  # same fingerprint seen in DB in last N days
+        dupes_local = 0           # same id twice this run
+        dupes_fuzzy = 0           # same title+company, similar description (this run)
 
-    excluded_title_kw = profile.get("excluded_title_keywords") or []
-    if excluded_title_kw:
-        logger.info(f"Excluded title keywords ({len(excluded_title_kw)}): {excluded_title_kw}")
-    else:
-        logger.info("No excluded title keywords set — title filter disabled")
+        all_raw_ids = [r.get("id", "") for r in raw_jobs if r.get("id")]
+        already_seen_ids = fetch_existing_ids(all_raw_ids) if all_raw_ids else set()
+        # Cross-run fuzzy: pull recent fingerprints once (degrades gracefully if column missing)
+        all_fps = [_fingerprint(normalise_job(r)) for r in raw_jobs]
+        recent_fp_map = fetch_recent_fingerprints(all_fps)
+        logger.info(
+            f"Batch dedup: {len(already_seen_ids)} exact-id seen / {len(all_raw_ids)} ids; "
+            f"{len(recent_fp_map)} fingerprints seen in last {CROSSRUN_DEDUP_DAYS}d"
+        )
 
-    # ── Phase 0: Fetch jobs from all sources in parallel ─────────────
-    raw_jobs, source_errors = _fetch_all_sources(keywords, profile)
+        processed_ids: set[str] = set()
+        fuzzy_groups: dict[str, list[dict]] = {}
+        company_jobs: dict[str, list[dict]] = {}
 
-    if not raw_jobs:
-        logger.error("No jobs fetched from any source.")
-        msg = "⚠️ Pipeline finished — 0 jobs fetched from all sources."
-        if source_errors:
-            msg += "\n\nFailed sources:\n" + "\n".join(
-                f"• {k}: {v}" for k, v in source_errors.items()
-            )
-        send_message(msg, parse_mode=None)
-        return
+        for raw in raw_jobs:
+            job = normalise_job(raw)
+            if not job["id"] or not job["title"]:
+                continue
 
-    logger.info(f"Total raw jobs: {len(raw_jobs)}")
+            if job["id"] in already_seen_ids:
+                dupes_crossrun += 1
+                continue
+            if job["id"] in processed_ids:
+                dupes_local += 1
+                continue
+            processed_ids.add(job["id"])
 
-    # ── Phase 1: Dedup + title exclusion filter (fast, sequential, no API calls) ──
-    candidates: list[dict] = []
-    skipped_excluded = 0
-    dupes_crossrun = 0   # already in Supabase from previous runs
-    dupes_local = 0      # same ID appeared multiple times this run
-    dupes_fuzzy = 0      # same title+company with similar description
+            norm_title = _normalise_title(job["title"])
+            norm_company = _normalise_company(job["company"])
+            dedup_key = f"{norm_title}|{norm_company}"
 
-    # Batch-fetch existing IDs from Supabase (1-2 queries instead of N)
-    all_raw_ids = [r.get("id", "") for r in raw_jobs if r.get("id")]
-    already_seen_ids = fetch_existing_ids(all_raw_ids) if all_raw_ids else set()
-    logger.info(f"Batch dedup: {len(already_seen_ids)} already seen out of {len(all_raw_ids)} raw IDs")
+            is_duplicate = False
 
-    processed_ids: set[str] = set()
-    # Two dedup indexes:
-    # 1. norm_title|norm_company → catches same title from different sources
-    # 2. norm_company            → catches template variants (same employer, same description, different title)
-    fuzzy_groups: dict[str, list[dict]] = {}
-    company_jobs: dict[str, list[dict]] = {}
+            # Cross-run fuzzy: same fingerprint seen recently in the DB
+            if dedup_key in recent_fp_map:
+                for desc in recent_fp_map[dedup_key]:
+                    if not desc or not job.get("description"):
+                        is_duplicate = True
+                        break
+                    if _description_similarity(job.get("description", ""), desc) >= DEDUP_SIMILARITY_THRESHOLD:
+                        is_duplicate = True
+                        break
+                if is_duplicate:
+                    dupes_crossrun_fuzzy += 1
 
-    for raw in raw_jobs:
-        job = normalise_job(raw)
+            # Same-run: same title+company with similar description
+            if not is_duplicate and dedup_key in fuzzy_groups:
+                for existing_job in fuzzy_groups[dedup_key]:
+                    if _description_similarity(job.get("description", ""), existing_job.get("description", "")) >= DEDUP_SIMILARITY_THRESHOLD:
+                        logger.info(f"[DEDUP] '{job['title']}' @ {job['company']} ≈ '{existing_job['title']}'")
+                        is_duplicate = True
+                        dupes_fuzzy += 1
+                        break
 
-        if not job["id"] or not job["title"]:
-            continue
+            # Same-run: same company, near-identical description (template variants)
+            if not is_duplicate and norm_company in company_jobs:
+                for existing_job in company_jobs[norm_company]:
+                    if _description_similarity(job.get("description", ""), existing_job.get("description", "")) >= COMPANY_VARIANT_SIM_THRESHOLD:
+                        logger.info(f"[DEDUP-VARIANT] '{job['title']}' @ {job['company']} ≈ '{existing_job['title']}'")
+                        is_duplicate = True
+                        dupes_fuzzy += 1
+                        break
 
-        # Dedup: Supabase (cross-run, catches jobs from previous days)
-        if job["id"] in already_seen_ids:
-            dupes_crossrun += 1
-            continue
+            if is_duplicate:
+                continue
 
-        # Dedup: local by ID (within this run — same job from same source)
-        if job["id"] in processed_ids:
-            dupes_local += 1
-            continue
-        processed_ids.add(job["id"])
+            fuzzy_groups.setdefault(dedup_key, []).append(job)
+            company_jobs.setdefault(norm_company, []).append(job)
 
-        # Smart fuzzy dedup: normalise title + company, then compare descriptions
-        norm_title = _normalise_title(job["title"])
-        norm_company = _normalise_company(job["company"])
-        dedup_key = f"{norm_title}|{norm_company}"
+            # genuinely new posting
+            base = _base_source(job["source"])
+            if base in per_source:
+                per_source[base]["new"] += 1
 
-        is_duplicate = False
-        if dedup_key in fuzzy_groups:
-            # Same normalised title+company exists — check if descriptions are similar
-            for existing_job in fuzzy_groups[dedup_key]:
-                sim = _description_similarity(
-                    job.get("description", ""),
-                    existing_job.get("description", ""),
-                )
-                if sim >= DEDUP_SIMILARITY_THRESHOLD:
-                    logger.info(
-                        f"[DEDUP] '{job['title']}' @ {job['company']} ({job.get('source')}) "
-                        f"≈ '{existing_job['title']}' @ {existing_job['company']} ({existing_job.get('source')}) "
-                        f"[similarity={sim:.0%}]"
-                    )
-                    is_duplicate = True
-                    break
+            if is_excluded_by_title(job, excluded_title_kw):
+                logger.info(f"[EXCLUDED] {job['title']} @ {job['company']}")
+                rows_to_save.append(_job_row(job, "filtered_excluded"))
+                skipped_excluded += 1
+                continue
 
-        # Cross-title dedup: same company, different title — catch template variants
-        # e.g. "Python AI Trainer" vs "JavaScript AI Trainer" from Outlier AI
-        if not is_duplicate and norm_company in company_jobs:
-            for existing_job in company_jobs[norm_company]:
-                sim = _description_similarity(
-                    job.get("description", ""),
-                    existing_job.get("description", ""),
-                )
-                if sim >= COMPANY_VARIANT_SIM_THRESHOLD:
-                    logger.info(
-                        f"[DEDUP-VARIANT] '{job['title']}' @ {job['company']} ({job.get('source')}) "
-                        f"≈ '{existing_job['title']}' (same company, similarity={sim:.0%})"
-                    )
-                    is_duplicate = True
-                    break
+            candidates.append(job)
 
-        if is_duplicate:
-            dupes_fuzzy += 1
-            continue
+        skipped_dupe = dupes_crossrun + dupes_crossrun_fuzzy + dupes_local + dupes_fuzzy
+        logger.info(
+            f"Phase 1 done — {len(candidates)} candidates, {skipped_dupe} dupes "
+            f"(id-prev: {dupes_crossrun}, fp-prev: {dupes_crossrun_fuzzy}, same-run id: {dupes_local}, "
+            f"same-run fuzzy: {dupes_fuzzy}), {skipped_excluded} excluded"
+        )
 
-        # Not a duplicate — register in both indexes
-        fuzzy_groups.setdefault(dedup_key, []).append(job)
-        company_jobs.setdefault(norm_company, []).append(job)
+        # ── Phase 2: score + enrich + send (parallel) ────────────────
+        sent = 0
+        skipped_score = 0
+        errors = 0
 
-        # Title exclusion filter
-        if is_excluded_by_title(job, excluded_title_kw):
-            logger.info(f"[EXCLUDED] {job['title']} @ {job['company']}")
-            save_job(job, "filtered_excluded")
-            skipped_excluded += 1
-            continue
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(_process_single_job, job, profile, threshold): job for job in candidates}
+            for future in as_completed(futures):
+                job, status = future.result()
+                rows_to_save.append(_job_row(job, status))
+                base = _base_source(job["source"])
+                if status == "sent":
+                    sent += 1
+                    if base in per_source:
+                        per_source[base]["sent"] += 1
+                elif status == "low_score":
+                    skipped_score += 1
+                elif status in ("notify_failed", "score_error"):
+                    errors += 1
+                    errors_log.append({"source": base, "stage": status, "message": f"{job.get('title','')[:80]}"})
 
-        candidates.append(job)
+        # batch-save everything at once (was hundreds of per-job upserts)
+        save_jobs_batch(rows_to_save)
 
-    skipped_dupe = dupes_crossrun + dupes_local + dupes_fuzzy
-    logger.info(
-        f"Phase 1 done — {len(candidates)} candidates, "
-        f"{skipped_dupe} dupes (prev runs: {dupes_crossrun}, same run: {dupes_local}, fuzzy: {dupes_fuzzy}), "
-        f"{skipped_excluded} excluded by title"
-    )
-
-    # ── Phase 2: Score + enrich + send IN PARALLEL ───────────────────
-    sent = 0
-    skipped_score = 0
-    errors = 0
-
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {
-            executor.submit(_process_single_job, job, profile, threshold): job
-            for job in candidates
+        totals = {
+            "fetched": sum(p["fetched"] for p in per_source.values()),
+            "new": sum(p["new"] for p in per_source.values()),
+            "sent": sent,
+            "cost_usd": total_cost,
         }
+        logger.info(
+            f"Pipeline done — sent: {sent}, low score: {skipped_score}, "
+            f"excluded: {skipped_excluded}, dupes: {skipped_dupe}, Apify ${total_cost:.2f}"
+        )
 
-        for future in as_completed(futures):
-            job, status = future.result()
+        source_errors = {name: p["error"] for name, p in per_source.items() if p["error"]}
+        send_daily_summary(
+            sent=sent,
+            skipped_score=skipped_score,
+            skipped_excluded=skipped_excluded,
+            skipped_dupe=skipped_dupe,
+            dupes_crossrun=dupes_crossrun + dupes_crossrun_fuzzy,
+            dupes_local=dupes_local,
+            dupes_fuzzy=dupes_fuzzy,
+            threshold=threshold,
+            source_errors=source_errors,
+            per_source=per_source,
+            total_cost=total_cost,
+        )
 
-            if status == "sent":
-                save_job(job, "sent")
-                sent += 1
-            elif status == "low_score":
-                save_job(job, "low_score")
-                skipped_score += 1
-            elif status == "notify_failed":
-                save_job(job, "notify_failed")
-                errors += 1
-            elif status == "score_error":
-                save_job(job, "score_error")
-                errors += 1
-
-    logger.info(
-        f"Pipeline done — sent: {sent}, "
-        f"low score: {skipped_score}, "
-        f"excluded: {skipped_excluded}, "
-        f"dupes: {skipped_dupe}"
-    )
-
-    send_daily_summary(
-        sent=sent,
-        skipped_score=skipped_score,
-        skipped_excluded=skipped_excluded,
-        skipped_dupe=skipped_dupe,
-        dupes_crossrun=dupes_crossrun,
-        dupes_local=dupes_local,
-        dupes_fuzzy=dupes_fuzzy,
-        threshold=threshold,
-        source_errors=source_errors,
-    )
+    except Exception:
+        tb = traceback.format_exc()
+        errors_log.append({"source": "pipeline", "stage": "fatal", "message": tb[:2000]})
+        ok = False
+        logger.error(f"Pipeline fatal:\n{tb}")
+        raise
+    finally:
+        # Always persist the run — this is the always-queryable audit log.
+        save_pipeline_run({
+            "started_at": started_at.isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "slot_utc": slot,
+            "keywords": keywords_used,
+            "per_source": per_source,
+            "totals": totals,
+            "errors": errors_log,
+            "ok": ok,
+        })
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lookback", type=int, default=None, help="search window seconds")
+    ap.add_argument("--slot", default=None, help="UTC slot label, e.g. 09:00")
+    args = ap.parse_args()
+    run_pipeline(lookback=args.lookback, slot=args.slot)

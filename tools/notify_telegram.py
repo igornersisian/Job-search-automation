@@ -156,8 +156,10 @@ def send_daily_summary(
     dupes_local: int = 0,
     dupes_fuzzy: int = 0,
     source_errors: dict | None = None,
+    per_source: dict | None = None,
+    total_cost: float | None = None,
 ) -> None:
-    """Send a brief daily pipeline summary.
+    """Send a brief pipeline summary, including a per-source breakdown.
 
     The summary itself uses Markdown. Source errors are sent as separate
     plain-text follow-up messages so response bodies (which often contain
@@ -175,15 +177,35 @@ def send_daily_summary(
             parts.append(f"fuzzy: {dupes_fuzzy}")
         if parts:
             dupe_detail = f" ({', '.join(parts)})"
+
+    cost_line = f" — Apify ${total_cost:.2f}" if total_cost is not None else ""
     text = (
-        f"*Daily job search complete*\n"
+        f"*Job search run complete*{cost_line}\n"
         f"✅ Sent to you: {sent}\n"
         f"🔕 Low score (<{threshold}%): {skipped_score}\n"
         f"🚫 Excluded by title: {skipped_excluded}\n"
         f"♻️ Duplicates skipped: {skipped_dupe}{dupe_detail}"
     )
+
+    # Per-source breakdown: fetched / new / sent (+ cost, cap flag)
+    if per_source:
+        lines = []
+        order = ["linkedin", "ats", "glassdoor", "indeed", "wellfound", "remoteboards"]
+        for name in order:
+            p = per_source.get(name)
+            if not p:
+                continue
+            flag = " ⚠️cap" if p.get("capped") else ""
+            err = " ❌" if p.get("error") else ""
+            lines.append(
+                f"• {name}: {p.get('fetched', 0)} fetched, {p.get('new', 0)} new, "
+                f"{p.get('sent', 0)} sent (${p.get('cost_usd', 0):.2f}){flag}{err}"
+            )
+        if lines:
+            text += "\n\n*By source* (fetched / new / sent):\n" + "\n".join(lines)
+
     if source_errors:
-        text += f"\n\n⚠️ Failed sources: {len(source_errors)} — details below"
+        text += f"\n\n⚠️ Errors: {len(source_errors)} — details below"
     try:
         send_message(text)
     except Exception as e:

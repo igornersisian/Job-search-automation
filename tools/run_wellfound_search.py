@@ -1,20 +1,18 @@
 """
-Trigger Apify Wellfound (AngelList) Scraper and return job list.
+Wellfound (AngelList) jobs via Apify, on the shared runner.
 
-Actor: clearpath/wellfound-api-ppe
-Docs:  https://apify.com/clearpath/wellfound-api-ppe
+Actor: clearpath/wellfound-api-ppe (id clearpath~wellfound-api-ppe)
+Wellfound has no free-text search — only fixed role-category URLs
+(wellfound.com/role/r/{slug}). We build URLs from `wellfound_roles` in the
+profile (set via /wellfound). NOTE: generic roles like "Software Engineer" pull
+traditional senior-SWE jobs that score ~0 for an AI-automation profile — set
+AI/ML-relevant roles for this source to be worth anything.
 
-This actor takes Wellfound URLs (not keywords).  We convert wellfound_roles
-(set via /wellfound bot command) into role-slug URLs like
-https://wellfound.com/role/r/software-engineer.
-
-Usage:
-    python tools/run_wellfound_search.py
+Exposes `fetch(keywords, *, lookback, profile)` -> apify_client.SourceResult.
 """
 
 import json
 import re
-import time
 import logging
 from datetime import datetime, timezone
 
@@ -34,12 +32,7 @@ ACTOR_ID = "clearpath~wellfound-api-ppe"
 
 
 def _role_to_slug(role: str) -> str:
-    """Convert a Wellfound role name to a URL slug.
-
-    'Software Engineer' → 'software-engineer'
-    'H.R.' → 'hr'
-    'Finance/Accounting' → 'finance-accounting'
-    """
+    """'Software Engineer' -> 'software-engineer'."""
     slug = role.lower().strip()
     slug = re.sub(r"[^a-z0-9\s-]", "", slug)
     slug = re.sub(r"\s+", "-", slug)
@@ -48,11 +41,6 @@ def _role_to_slug(role: str) -> str:
 
 
 def _build_urls(roles: list[str]) -> list[str]:
-    """Build Wellfound search URLs from role names.
-
-    Uses validated role names from the /wellfound bot command.
-    Deduplicates slugs.
-    """
     seen: set[str] = set()
     urls: list[str] = []
     for role in roles:
@@ -63,62 +51,8 @@ def _build_urls(roles: list[str]) -> list[str]:
     return urls
 
 
-def run_actor(roles: list[str]) -> tuple[str, str]:
-    url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
-    search_urls = _build_urls(roles)
-
-    actor_input = {
-        "urls": search_urls,
-        "pageLimit": 1,
-        "onlyRemoteJobs": True,
-        "sortBy": "LAST_POSTED",
-    }
-    logger.info(f"Starting Wellfound actor run with {len(search_urls)} keyword URLs (pageLimit=1, {apify_client.active_slot_summary()})...")
-    resp, token = apify_client.post(url, json_body=actor_input, timeout=30)
-    apify_client.raise_for_status_verbose(resp, f"Wellfound start (input={json.dumps(actor_input, ensure_ascii=False)[:500]})")
-    run_id = resp.json()["data"]["id"]
-    logger.info(f"Wellfound actor run started: {run_id}")
-    return run_id, token
-
-
-def wait_for_run(run_id: str, token: str, timeout_seconds: int = 600) -> str:
-    url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    deadline = time.time() + timeout_seconds
-
-    while time.time() < deadline:
-        resp = apify_client.get(url, token, timeout=15)
-        apify_client.raise_for_status_verbose(resp, f"Wellfound poll run={run_id}")
-        data = resp.json()["data"]
-        status = data["status"]
-
-        if status == "SUCCEEDED":
-            dataset_id = data["defaultDatasetId"]
-            logger.info(f"Wellfound run succeeded. Dataset: {dataset_id}")
-            return dataset_id
-        elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
-            status_msg = data.get("statusMessage") or ""
-            apify_client.report_run_failure(token, status, status_msg)
-            raise RuntimeError(f"Wellfound actor run ended with status: {status} ({status_msg[:200]})")
-
-        logger.info(f"Wellfound run status: {status}. Waiting...")
-        time.sleep(10)
-
-    raise TimeoutError(f"Wellfound actor run {run_id} did not finish within {timeout_seconds}s")
-
-
-def fetch_dataset(dataset_id: str, token: str) -> list[dict]:
-    url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-    logger.info(f"Downloading Wellfound dataset {dataset_id}...")
-    resp = apify_client.get(url, token, params={"format": "json", "clean": "true"}, timeout=60)
-    apify_client.raise_for_status_verbose(resp, f"Wellfound dataset={dataset_id}")
-    items = resp.json()
-    logger.info(f"Downloaded {len(items)} Wellfound jobs")
-    return items
-
-
 def normalise_wellfound(raw: dict) -> dict:
     """Map Wellfound output fields to the shared job schema."""
-    # Salary — use parsed base_salary if available, else raw compensation string
     salary_text = ""
     base = raw.get("base_salary") or {}
     if base and base.get("min_value"):
@@ -133,7 +67,6 @@ def normalise_wellfound(raw: dict) -> dict:
     if not salary_text:
         salary_text = raw.get("compensation", "")
 
-    # Equity info — append if present
     equity = raw.get("equity_parsed") or {}
     if equity.get("has_equity"):
         eq_min = equity.get("min_percentage", 0)
@@ -141,19 +74,15 @@ def normalise_wellfound(raw: dict) -> dict:
         if eq_min and eq_max:
             salary_text = f"{salary_text} + {eq_min}%-{eq_max}% equity".strip()
 
-    # Location
     locations = raw.get("location_names") or []
     location_str = ", ".join(locations[:3])
 
-    # Posted date
     posted_at = raw.get("posted_at") or None
     if not posted_at:
         ts = raw.get("live_start_at")
         if ts:
             posted_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
-    # URL — construct from id+slug for working links
-    # Wellfound format: https://wellfound.com/jobs/{id}-{slug}
     job_id = raw.get("id", "")
     slug = raw.get("slug", "")
     if job_id and slug:
@@ -175,28 +104,30 @@ def normalise_wellfound(raw: dict) -> dict:
     }
 
 
-def run_search(keywords: list[str], profile: dict | None = None) -> list[dict]:
-    """Full flow: trigger → wait → fetch → normalise.
-
-    Uses wellfound_roles from profile (set via /wellfound bot command).
-    Falls back to empty list if no roles configured — skips Wellfound entirely.
-    keywords arg is ignored (kept for interface consistency with other scrapers).
-    """
+def fetch(keywords: list[str], *, lookback: int = 86400, profile: dict | None = None) -> apify_client.SourceResult:
+    """Run Wellfound for the configured roles. `keywords`/`lookback` unused
+    (Wellfound has no free-text search and no time filter — it sorts by
+    LAST_POSTED and we take one page)."""
     roles = (profile or {}).get("wellfound_roles") or []
     if not roles:
-        logger.info("No Wellfound roles configured — skipping Wellfound search. Use /wellfound in bot to set roles.")
-        return []
+        logger.info("No Wellfound roles configured — skipping. Use /wellfound to set roles.")
+        return apify_client.SourceResult(source="wellfound")
 
+    search_urls = _build_urls(roles)
+    actor_input = {
+        "urls": search_urls,
+        "pageLimit": 1,
+        "onlyRemoteJobs": True,
+        "sortBy": "LAST_POSTED",
+    }
     logger.info(f"Wellfound roles ({len(roles)}): {roles}")
-    run_id, token = run_actor(roles)
-    dataset_id = wait_for_run(run_id, token)
-    raw_items = fetch_dataset(dataset_id, token)
-    return [normalise_wellfound(item) for item in raw_items]
+    return apify_client.run_actor_job(
+        ACTOR_ID, actor_input,
+        source="wellfound", normalise=normalise_wellfound, cap=None,
+    )
 
 
 if __name__ == "__main__":
-    test_roles = ["Software Engineer", "Data Scientist"]
-    # Simulate profile with wellfound_roles for standalone testing
-    jobs = run_search([], {"wellfound_roles": test_roles})
-    print(json.dumps(jobs, ensure_ascii=False, indent=2))
-    logger.info(f"Done. {len(jobs)} Wellfound jobs fetched.")
+    r = fetch([], profile={"wellfound_roles": ["Machine Learning Engineer", "AI Engineer"]})
+    print(json.dumps(r.items, ensure_ascii=False, indent=2))
+    logger.info(f"Done. {len(r.items)} Wellfound jobs, ${r.cost_usd:.4f}, error={r.error}")

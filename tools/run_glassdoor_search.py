@@ -1,18 +1,19 @@
 """
-Trigger Apify Glassdoor Jobs Scraper and return job list.
+Glassdoor jobs via Apify, on the shared runner.
 
-Actor: valig/glassdoor-jobs-scraper
-ID:    5OaooRg0FxlRF0L1B
-Docs:  https://apify.com/valig/glassdoor-jobs-scraper
+Actor: valig/glassdoor-jobs-scraper (id 5OaooRg0FxlRF0L1B)
+One actor run per keyword, fanned out in PARALLEL and merged. daysOld is
+whole-days only, so the window effectively stays 24h; cross-run dedup removes
+slot overlap. High match volume at low cost (~$0.08/run).
 
-Usage:
-    python tools/run_glassdoor_search.py
+Exposes `fetch(keywords, *, lookback)` -> apify_client.SourceResult.
 """
 
 import json
-import time
 import logging
+import math
 from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 
@@ -26,64 +27,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-ACTOR_ID = "5OaooRg0FxlRF0L1B"
-
-
-def run_actor(keyword: str) -> tuple[str, str]:
-    """Start one Glassdoor actor run for a single keyword. Returns (run_id, token_used)."""
-    url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
-    actor_input = {
-        "keywords": keyword,
-        "location": "United States",
-        "daysOld": 1,
-        "limit": 25,
-    }
-    logger.info(f"Starting Glassdoor actor run: '{keyword}' ({apify_client.active_slot_summary()})")
-    resp, token = apify_client.post(url, json_body=actor_input, timeout=30)
-    apify_client.raise_for_status_verbose(resp, f"Glassdoor start (input={json.dumps(actor_input, ensure_ascii=False)[:500]})")
-    run_id = resp.json()["data"]["id"]
-    logger.info(f"Glassdoor actor run started: {run_id}")
-    return run_id, token
-
-
-def wait_for_run(run_id: str, token: str, timeout_seconds: int = 600) -> str:
-    url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    deadline = time.time() + timeout_seconds
-
-    while time.time() < deadline:
-        resp = apify_client.get(url, token, timeout=15)
-        apify_client.raise_for_status_verbose(resp, f"Glassdoor poll run={run_id}")
-        data = resp.json()["data"]
-        status = data["status"]
-
-        if status == "SUCCEEDED":
-            dataset_id = data["defaultDatasetId"]
-            logger.info(f"Glassdoor run succeeded. Dataset: {dataset_id}")
-            return dataset_id
-        elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
-            status_msg = data.get("statusMessage") or ""
-            apify_client.report_run_failure(token, status, status_msg)
-            raise RuntimeError(f"Glassdoor actor run ended with status: {status} ({status_msg[:200]})")
-
-        logger.info(f"Glassdoor run status: {status}. Waiting...")
-        time.sleep(10)
-
-    raise TimeoutError(f"Glassdoor actor run {run_id} did not finish within {timeout_seconds}s")
-
-
-def fetch_dataset(dataset_id: str, token: str) -> list[dict]:
-    url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-    logger.info(f"Downloading Glassdoor dataset {dataset_id}...")
-    resp = apify_client.get(url, token, params={"format": "json", "clean": "true"}, timeout=60)
-    apify_client.raise_for_status_verbose(resp, f"Glassdoor dataset={dataset_id}")
-    items = resp.json()
-    logger.info(f"Downloaded {len(items)} Glassdoor jobs")
-    return items
+ACTOR_ID = "5OaooRg0FxlRF0L1B"  # valig/glassdoor-jobs-scraper
+LIMIT = 25  # per keyword → cap / truncation threshold
 
 
 def normalise_glassdoor(raw: dict) -> dict:
     """Map Glassdoor output fields to the shared job schema."""
-    # Salary from pay object
     pay = raw.get("pay") or {}
     salary_text = ""
     if pay:
@@ -97,17 +46,11 @@ def normalise_glassdoor(raw: dict) -> dict:
         elif lo:
             salary_text = f"{symbol}{lo:,}+ {period}".strip()
 
-    # Location
     location = raw.get("location") or {}
     location_str = location.get("name", "")
-
-    # Company from employer object
     employer = raw.get("employer") or {}
-
-    # URL — prefer seoUrl for human-readable links
     job_url = raw.get("seoUrl") or raw.get("url", "")
 
-    # Posted date — convert ageInDays to approximate ISO date
     posted_at = None
     age = raw.get("ageInDays")
     if age is not None:
@@ -127,36 +70,30 @@ def normalise_glassdoor(raw: dict) -> dict:
     }
 
 
-def _search_one(keyword: str) -> list[dict]:
-    """Run a single keyword search end-to-end."""
-    run_id, token = run_actor(keyword)
-    dataset_id = wait_for_run(run_id, token)
-    return fetch_dataset(dataset_id, token)
+def _fetch_one(keyword: str, days_old: int) -> apify_client.SourceResult:
+    actor_input = {
+        "keywords": keyword,
+        "location": "United States",
+        "daysOld": days_old,
+        "limit": LIMIT,
+    }
+    return apify_client.run_actor_job(
+        ACTOR_ID, actor_input,
+        source="glassdoor", normalise=normalise_glassdoor, cap=LIMIT,
+    )
 
 
-def run_search(keywords: list[str]) -> list[dict]:
-    """Run one Glassdoor search per keyword (sequentially), deduplicate results."""
-    all_jobs: list[dict] = []
-    seen_ids: set[str] = set()
-
-    for kw in keywords:
-        try:
-            raw_items = _search_one(kw)
-            added = 0
-            for item in raw_items:
-                job = normalise_glassdoor(item)
-                if job["id"] and job["id"] not in seen_ids:
-                    seen_ids.add(job["id"])
-                    all_jobs.append(job)
-                    added += 1
-            logger.info(f"Glassdoor '{kw}': {len(raw_items)} raw, {added} new")
-        except Exception as e:
-            logger.error(f"Glassdoor search failed for '{kw}': {e}")
-
-    return all_jobs
+def fetch(keywords: list[str], *, lookback: int = 86400) -> apify_client.SourceResult:
+    """Run one Glassdoor search per keyword in parallel and merge."""
+    if not keywords:
+        return apify_client.SourceResult(source="glassdoor")
+    days_old = max(1, math.ceil(lookback / 86400))  # whole days; min 1
+    with ThreadPoolExecutor(max_workers=min(5, len(keywords))) as ex:
+        results = list(ex.map(lambda kw: _fetch_one(kw, days_old), keywords))
+    return apify_client.merge_results("glassdoor", results)
 
 
 if __name__ == "__main__":
-    jobs = run_search(["automation engineer", "AI workflow"])
-    print(json.dumps(jobs, ensure_ascii=False, indent=2))
-    logger.info(f"Done. {len(jobs)} Glassdoor jobs fetched.")
+    r = fetch(["automation engineer", "AI engineer"], lookback=86400)
+    print(json.dumps(r.items, ensure_ascii=False, indent=2))
+    logger.info(f"Done. {len(r.items)} Glassdoor jobs, ${r.cost_usd:.4f}, capped={r.capped}, error={r.error}")

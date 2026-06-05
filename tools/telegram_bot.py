@@ -879,13 +879,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ---------------------------------------------------------------------------
 
 async def scheduled_pipeline(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Run the daily job search pipeline on schedule."""
-    logger.info("Scheduled daily pipeline triggered")
+    """Run the job search pipeline for one scheduled slot.
+
+    `context.job.data` carries the slot label ('03:00' etc.) so the pipeline
+    can gate low-yield sources (Wellfound) to a single slot.
+    """
+    slot = getattr(context.job, "data", None)
+    logger.info(f"Scheduled pipeline triggered (slot={slot})")
 
     def run_pipeline_sync():
         sys.path.insert(0, os.path.dirname(__file__))
         from process_jobs import run_pipeline
-        run_pipeline()
+        run_pipeline(slot=slot)
 
     loop = asyncio.get_running_loop()
     try:
@@ -928,14 +933,18 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Daily pipeline: weekdays at 09:00 UTC
-    app.job_queue.run_daily(
-        scheduled_pipeline,
-        time=dt_time(hour=9, minute=0, tzinfo=timezone.utc),
-        days=(0, 1, 2, 3, 4, 5, 6),  # Every day
-        name="daily_job_search",
-    )
-    logger.info("Scheduled daily pipeline for weekdays 09:00 UTC")
+    # Pipeline 4×/day at 03:00 / 09:00 / 15:00 / 21:00 UTC
+    # (= 10:00 / 16:00 / 22:00 / 04:00 GMT+7), every day. Even 6h spacing.
+    for hour in (3, 9, 15, 21):
+        slot = f"{hour:02d}:00"
+        app.job_queue.run_daily(
+            scheduled_pipeline,
+            time=dt_time(hour=hour, minute=0, tzinfo=timezone.utc),
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name=f"job_search_{slot}",
+            data=slot,
+        )
+    logger.info("Scheduled pipeline at 03/09/15/21 UTC daily (4×/day)")
 
     logger.info("Bot started (long-polling)")
     app.run_polling(drop_pending_updates=True)

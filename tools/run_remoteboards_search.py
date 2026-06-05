@@ -1,18 +1,19 @@
 """
-Trigger Apify JobsFlow actor and return normalised job list.
+Remote job boards (RemoteOK, Remotive, WeWorkRemotely) via Apify JobsFlow,
+on the shared runner.
 
-Actor: zyncodltd/JobsFlow
-ID:    l09aaDKNa1G3SVFzr
-Docs:  https://console.apify.com/actors/l09aaDKNa1G3SVFzr
+Actor: silicatelabs/JobsFlow (id l09aaDKNa1G3SVFzr). NOTE: this actor changed
+owner from zyncodltd and its input schema is now
+{searchKeywords: string, techStack: string, maxJobs: int}. These boards tag
+jobs by tech stack (python/n8n/react), not by role phrases — sending only
+phrase-style searchKeywords returned 0 results. We now also send `techStack`.
+Free actor ($0). Validate with a test run; tune `techStack` via the profile
+override `remoteboards_tech_stack` if results are empty.
 
-Aggregates remote jobs from RemoteOK, Remotive, and WeWorkRemotely.
-
-Usage:
-    python tools/run_remoteboards_search.py
+Exposes `fetch(keywords, *, lookback, profile)` -> apify_client.SourceResult.
 """
 
 import json
-import time
 import logging
 
 from dotenv import load_dotenv
@@ -27,75 +28,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-ACTOR_ID = "l09aaDKNa1G3SVFzr"  # zyncodltd/JobsFlow
+ACTOR_ID = "l09aaDKNa1G3SVFzr"  # silicatelabs/JobsFlow
+MAX_JOBS = 150
 
 
-def run_actor(keywords: list[str]) -> tuple[str, str]:
-    """Start the JobsFlow actor run. Returns (run_id, token_used)."""
-    url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
-
-    # JobsFlow accepts a single searchKeywords string
-    # Join multiple keywords with comma for broader results
-    search_str = ", ".join(keywords[:5]) if keywords else ""
-
-    actor_input = {
-        "maxJobs": 150,
-    }
-    if search_str:
-        actor_input["searchKeywords"] = search_str
-
-    logger.info(f"Starting JobsFlow actor run (keywords: '{search_str}', {apify_client.active_slot_summary()})...")
-    resp, token = apify_client.post(url, json_body=actor_input, timeout=30)
-    apify_client.raise_for_status_verbose(resp, f"JobsFlow start (input={json.dumps(actor_input, ensure_ascii=False)[:500]})")
-
-    run_id = resp.json()["data"]["id"]
-    logger.info(f"JobsFlow actor run started: {run_id}")
-    return run_id, token
-
-
-def wait_for_run(run_id: str, token: str, timeout_seconds: int = 600) -> str:
-    """Poll until the run is SUCCEEDED, return dataset_id."""
-    url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    deadline = time.time() + timeout_seconds
-
-    while time.time() < deadline:
-        resp = apify_client.get(url, token, timeout=15)
-        apify_client.raise_for_status_verbose(resp, f"JobsFlow poll run={run_id}")
-        data = resp.json()["data"]
-        status = data["status"]
-
-        if status == "SUCCEEDED":
-            dataset_id = data["defaultDatasetId"]
-            logger.info(f"JobsFlow run succeeded. Dataset: {dataset_id}")
-            return dataset_id
-        elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
-            status_msg = data.get("statusMessage") or ""
-            apify_client.report_run_failure(token, status, status_msg)
-            raise RuntimeError(f"JobsFlow actor run {run_id} ended with status: {status} ({status_msg[:200]})")
-
-        logger.info(f"JobsFlow run status: {status}. Waiting...")
-        time.sleep(10)
-
-    raise TimeoutError(f"JobsFlow actor run {run_id} did not finish within {timeout_seconds}s")
-
-
-def fetch_dataset(dataset_id: str, token: str) -> list[dict]:
-    """Download all items from an Apify dataset."""
-    url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-    logger.info(f"Downloading JobsFlow dataset {dataset_id}...")
-    resp = apify_client.get(url, token, params={"format": "json", "clean": "true"}, timeout=60)
-    apify_client.raise_for_status_verbose(resp, f"JobsFlow dataset={dataset_id}")
-
-    items = resp.json()
-    logger.info(f"Downloaded {len(items)} JobsFlow jobs")
-    return items
+def _tech_stack(keywords: list[str], profile: dict | None) -> str:
+    """techStack string for the tag-based boards. Profile override wins;
+    otherwise derive from keywords (the actor matches against job tech tags)."""
+    override = (profile or {}).get("remoteboards_tech_stack")
+    if override:
+        return override if isinstance(override, str) else ", ".join(override)
+    return ", ".join(keywords[:8])
 
 
 def normalise_remoteboards(raw: dict) -> dict:
-    """Map JobsFlow output to the shared job schema.
-
-    JobsFlow fields: id, title, company, location, salary, tags, url, source, posted_at, description
-    """
+    """Map JobsFlow output to the shared job schema."""
     return {
         "id": str(raw.get("id", "")),
         "title": raw.get("title", ""),
@@ -110,15 +57,25 @@ def normalise_remoteboards(raw: dict) -> dict:
     }
 
 
-def run_search(keywords: list[str]) -> list[dict]:
-    """Full flow: trigger -> wait -> fetch -> normalise. Returns list of job dicts."""
-    run_id, token = run_actor(keywords)
-    dataset_id = wait_for_run(run_id, token)
-    raw_items = fetch_dataset(dataset_id, token)
-    return [normalise_remoteboards(item) for item in raw_items]
+def fetch(keywords: list[str], *, lookback: int = 86400, profile: dict | None = None) -> apify_client.SourceResult:
+    """Run JobsFlow over the remote boards. lookback unused (actor has no time
+    filter)."""
+    actor_input = {"maxJobs": MAX_JOBS}
+    search_str = ", ".join(keywords[:5]) if keywords else ""
+    if search_str:
+        actor_input["searchKeywords"] = search_str
+    tech = _tech_stack(keywords, profile)
+    if tech:
+        actor_input["techStack"] = tech
+
+    logger.info(f"JobsFlow input: searchKeywords='{search_str}', techStack='{tech}'")
+    return apify_client.run_actor_job(
+        ACTOR_ID, actor_input,
+        source="remoteboards", normalise=normalise_remoteboards, cap=MAX_JOBS,
+    )
 
 
 if __name__ == "__main__":
-    jobs = run_search(["automation engineer", "AI workflow"])
-    print(json.dumps(jobs, ensure_ascii=False, indent=2))
-    logger.info(f"Done. {len(jobs)} remote board jobs fetched.")
+    r = fetch(["automation engineer", "n8n", "python"], profile=None)
+    print(json.dumps(r.items, ensure_ascii=False, indent=2))
+    logger.info(f"Done. {len(r.items)} remoteboards jobs, ${r.cost_usd:.4f}, error={r.error}")

@@ -1,16 +1,18 @@
 """
-Trigger Apify Indeed Jobs Scraper and return job list.
+Indeed jobs via Apify, on the shared runner.
 
-Actor: valig/indeed-jobs-scraper
-Docs:  https://apify.com/valig/indeed-jobs-scraper
+Actor: valig/indeed-jobs-scraper (id valig~indeed-jobs-scraper)
+One actor run per keyword (the actor takes a single title), fanned out in
+PARALLEL and merged. datePosted granularity is whole days only, so the lookback
+window effectively stays 24h; cross-run dedup removes the slot overlap.
 
-Usage:
-    python tools/run_indeed_search.py
+Exposes `fetch(keywords, *, lookback)` -> apify_client.SourceResult.
 """
 
 import json
-import time
 import logging
+import math
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 
@@ -25,64 +27,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ACTOR_ID = "valig~indeed-jobs-scraper"
-
-
-def run_actor(keyword: str) -> tuple[str, str]:
-    """Start one Indeed actor run for a single keyword. Returns (run_id, token_used)."""
-    url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
-    actor_input = {
-        "title": keyword,
-        "country": "us",
-        "location": "remote",
-        "datePosted": "1",   # last 24 hours
-        "limit": 25,
-    }
-    logger.info(f"Starting Indeed actor run: '{keyword}' ({apify_client.active_slot_summary()})")
-    resp, token = apify_client.post(url, json_body=actor_input, timeout=30)
-    apify_client.raise_for_status_verbose(resp, f"Indeed start (input={json.dumps(actor_input, ensure_ascii=False)[:500]})")
-    run_id = resp.json()["data"]["id"]
-    logger.info(f"Indeed actor run started: {run_id}")
-    return run_id, token
-
-
-def wait_for_run(run_id: str, token: str, timeout_seconds: int = 600) -> str:
-    url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    deadline = time.time() + timeout_seconds
-
-    while time.time() < deadline:
-        resp = apify_client.get(url, token, timeout=15)
-        apify_client.raise_for_status_verbose(resp, f"Indeed poll run={run_id}")
-        data = resp.json()["data"]
-        status = data["status"]
-
-        if status == "SUCCEEDED":
-            dataset_id = data["defaultDatasetId"]
-            logger.info(f"Indeed run succeeded. Dataset: {dataset_id}")
-            return dataset_id
-        elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
-            status_msg = data.get("statusMessage") or ""
-            apify_client.report_run_failure(token, status, status_msg)
-            raise RuntimeError(f"Indeed actor run ended with status: {status} ({status_msg[:200]})")
-
-        logger.info(f"Indeed run status: {status}. Waiting...")
-        time.sleep(10)
-
-    raise TimeoutError(f"Indeed actor run {run_id} did not finish within {timeout_seconds}s")
-
-
-def fetch_dataset(dataset_id: str, token: str) -> list[dict]:
-    url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-    logger.info(f"Downloading Indeed dataset {dataset_id}...")
-    resp = apify_client.get(url, token, params={"format": "json", "clean": "true"}, timeout=60)
-    apify_client.raise_for_status_verbose(resp, f"Indeed dataset={dataset_id}")
-    items = resp.json()
-    logger.info(f"Downloaded {len(items)} Indeed jobs")
-    return items
+LIMIT = 25  # per keyword → cap / truncation threshold
 
 
 def normalise_indeed(raw: dict) -> dict:
     """Map Indeed output fields to the shared job schema."""
-    # Salary
     salary_text = ""
     base = raw.get("baseSalary") or {}
     if base:
@@ -96,16 +45,12 @@ def normalise_indeed(raw: dict) -> dict:
         elif lo:
             salary_text = f"{symbol}{lo:,}+/{unit}".strip()
 
-    # Location
     loc = raw.get("location") or {}
     parts = [loc.get("city"), loc.get("admin1Code"), loc.get("countryCode")]
     location_str = ", ".join(p for p in parts if p)
 
-    # Description - prefer plain text over HTML
     desc = raw.get("description") or {}
     description = desc.get("text", "") if isinstance(desc, dict) else str(desc)
-
-    # Job URL - prefer direct employer URL, fall back to Indeed URL
     job_url = raw.get("jobUrl") or raw.get("url", "")
 
     return {
@@ -117,41 +62,36 @@ def normalise_indeed(raw: dict) -> dict:
         "description": description,
         "location": location_str,
         "postedAt": raw.get("datePublished"),
-        "is_remote": False,  # Indeed doesn't have a dedicated remote flag
+        "is_remote": True,   # we query location=remote
         "source": "indeed",
     }
 
 
-def _search_one(keyword: str) -> list[dict]:
-    """Run a single keyword search end-to-end."""
-    run_id, token = run_actor(keyword)
-    dataset_id = wait_for_run(run_id, token)
-    return fetch_dataset(dataset_id, token)
+def _fetch_one(keyword: str, date_posted: str) -> apify_client.SourceResult:
+    actor_input = {
+        "title": keyword,
+        "country": "us",
+        "location": "remote",
+        "datePosted": date_posted,
+        "limit": LIMIT,
+    }
+    return apify_client.run_actor_job(
+        ACTOR_ID, actor_input,
+        source="indeed", normalise=normalise_indeed, cap=LIMIT,
+    )
 
 
-def run_search(keywords: list[str]) -> list[dict]:
-    """Run one Indeed search per keyword (sequentially), deduplicate results."""
-    all_jobs: list[dict] = []
-    seen_ids: set[str] = set()
-
-    for kw in keywords:
-        try:
-            raw_items = _search_one(kw)
-            added = 0
-            for item in raw_items:
-                job = normalise_indeed(item)
-                if job["id"] and job["id"] not in seen_ids:
-                    seen_ids.add(job["id"])
-                    all_jobs.append(job)
-                    added += 1
-            logger.info(f"Indeed '{kw}': {len(raw_items)} raw, {added} new")
-        except Exception as e:
-            logger.error(f"Indeed search failed for '{kw}': {e}")
-
-    return all_jobs
+def fetch(keywords: list[str], *, lookback: int = 86400) -> apify_client.SourceResult:
+    """Run one Indeed search per keyword in parallel and merge."""
+    if not keywords:
+        return apify_client.SourceResult(source="indeed")
+    date_posted = str(max(1, math.ceil(lookback / 86400)))  # whole days; min 1
+    with ThreadPoolExecutor(max_workers=min(5, len(keywords))) as ex:
+        results = list(ex.map(lambda kw: _fetch_one(kw, date_posted), keywords))
+    return apify_client.merge_results("indeed", results)
 
 
 if __name__ == "__main__":
-    jobs = run_search(["automation engineer", "AI workflow"])
-    print(json.dumps(jobs, ensure_ascii=False, indent=2))
-    logger.info(f"Done. {len(jobs)} Indeed jobs fetched.")
+    r = fetch(["automation engineer", "AI workflow"], lookback=86400)
+    print(json.dumps(r.items, ensure_ascii=False, indent=2))
+    logger.info(f"Done. {len(r.items)} Indeed jobs, ${r.cost_usd:.4f}, capped={r.capped}, error={r.error}")
