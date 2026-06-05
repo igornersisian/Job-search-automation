@@ -892,7 +892,18 @@ async def scheduled_pipeline(context: ContextTypes.DEFAULT_TYPE) -> None:
         await loop.run_in_executor(None, run_pipeline_sync)
         logger.info("Scheduled pipeline finished")
     except Exception as e:
-        logger.error(f"Scheduled pipeline failed: {e}")
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(f"Scheduled pipeline failed: {e}\n{tb}")
+        try:
+            sys.path.insert(0, os.path.dirname(__file__))
+            from notify_telegram import _send_chunked
+            _send_chunked(
+                f"⚠️ Scheduled pipeline crashed:\n\n{type(e).__name__}: {e}\n\n{tb}",
+                parse_mode=None,
+            )
+        except Exception as notify_err:
+            logger.error(f"Could not notify Telegram about pipeline crash: {notify_err}")
 
 
 # ---------------------------------------------------------------------------

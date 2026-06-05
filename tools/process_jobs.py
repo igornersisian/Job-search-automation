@@ -100,6 +100,8 @@ _COMPANY_TRADE_WORDS = {
 
 def _normalise_title(title: str) -> str:
     """Normalise a job title for dedup comparison."""
+    if not title:
+        return ""
     t = title.lower().strip()
     # Remove common punctuation noise
     t = t.replace("-", " ").replace("–", " ").replace("/", " ")
@@ -114,6 +116,8 @@ def _normalise_title(title: str) -> str:
 
 def _normalise_company(company: str) -> str:
     """Normalise a company name for dedup comparison."""
+    if not company:
+        return ""
     c = company.lower().strip()
     for suffix in _COMPANY_SUFFIXES:
         if c.endswith(suffix):
@@ -234,17 +238,22 @@ def normalise_job(raw: dict) -> dict:
     """Pass through already-normalised fields from source scrapers.
     All source scrapers normalise their output,
     so this just ensures required keys exist with sensible defaults.
+
+    Uses `... or ""` instead of `dict.get(k, "")` because scrapers occasionally
+    put explicit None values in their output (e.g. a missing employer name from
+    an upstream payload). dict.get returns None in that case, which would then
+    blow up downstream on `.lower()` etc.
     """
     return {
-        "id": raw.get("id", ""),
-        "title": raw.get("title", ""),
-        "company": raw.get("company", ""),
-        "url": raw.get("url", ""),
-        "salary": raw.get("salary", ""),
-        "description": raw.get("description", ""),
-        "location": raw.get("location", ""),
+        "id": raw.get("id") or "",
+        "title": raw.get("title") or "",
+        "company": raw.get("company") or "",
+        "url": raw.get("url") or "",
+        "salary": raw.get("salary") or "",
+        "description": raw.get("description") or "",
+        "location": raw.get("location") or "",
         "postedAt": raw.get("postedAt"),
-        "source": raw.get("source", "linkedin"),
+        "source": raw.get("source") or "linkedin",
     }
 
 
