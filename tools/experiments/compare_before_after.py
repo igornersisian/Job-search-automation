@@ -41,11 +41,11 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 from dotenv import load_dotenv
 from supabase import create_client
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent  # repo root (script is in tools/experiments/)
 sys.path.insert(0, str(ROOT))
 
 from tools.score_job import score_job  # noqa: E402
-from tools.score_job_semi_naive import score_job_semi_naive  # noqa: E402
+from tools.experiments.score_job_semi_naive import score_job_semi_naive  # noqa: E402
 
 load_dotenv()
 

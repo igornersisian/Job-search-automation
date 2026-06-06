@@ -28,7 +28,7 @@ import tiktoken
 from supabase import create_client
 from dotenv import load_dotenv
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # tools/ (script is in tools/experiments/)
 from score_job import score_job, build_scoring_prompt
 
 load_dotenv()

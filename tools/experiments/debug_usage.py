@@ -18,7 +18,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 from dotenv import load_dotenv
 from supabase import create_client
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent  # repo root (script is in tools/experiments/)
 sys.path.insert(0, str(ROOT))
 
 from tools.score_job import build_scoring_prompt, get_openai, _build_rules_text  # noqa: E402
