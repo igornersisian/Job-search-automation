@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 import apify_client
+from normalise_utils import format_salary
 
 load_dotenv()
 
@@ -34,17 +35,13 @@ LIMIT = 100  # per keyword → cap / truncation threshold (raised 25→100; chea
 def normalise_glassdoor(raw: dict) -> dict:
     """Map Glassdoor output fields to the shared job schema."""
     pay = raw.get("pay") or {}
-    salary_text = ""
-    if pay:
-        lo = pay.get("min")
-        hi = pay.get("max")
-        currency = pay.get("currency") or "USD"
-        period = (pay.get("period") or "").capitalize()
-        symbol = "$" if currency == "USD" else currency + " "
-        if lo and hi:
-            salary_text = f"{symbol}{lo:,}–{symbol}{hi:,} {period}".strip()
-        elif lo:
-            salary_text = f"{symbol}{lo:,}+ {period}".strip()
+    period = (pay.get("period") or "").capitalize()
+    salary_text = format_salary(
+        pay.get("min"), pay.get("max"),
+        currency=pay.get("currency") or "USD",
+        sep="–",  # en-dash, as before
+        suffix=f" {period}",
+    )
 
     location = raw.get("location") or {}
     location_str = location.get("name", "")

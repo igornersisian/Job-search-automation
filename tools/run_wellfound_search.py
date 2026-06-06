@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 import apify_client
+from normalise_utils import format_salary
 
 load_dotenv()
 
@@ -53,17 +54,14 @@ def _build_urls(roles: list[str]) -> list[str]:
 
 def normalise_wellfound(raw: dict) -> dict:
     """Map Wellfound output fields to the shared job schema."""
-    salary_text = ""
     base = raw.get("base_salary") or {}
-    if base and base.get("min_value"):
-        lo = base.get("min_value")
-        hi = base.get("max_value")
-        currency = base.get("currency", "USD")
-        symbol = "$" if currency == "USD" else currency + " "
-        if lo and hi:
-            salary_text = f"{symbol}{int(lo):,}-{symbol}{int(hi):,}/Year"
-        elif lo:
-            salary_text = f"{symbol}{int(lo):,}+/Year"
+    lo, hi = base.get("min_value"), base.get("max_value")
+    salary_text = format_salary(
+        int(lo) if lo else None,
+        int(hi) if hi else None,
+        currency=base.get("currency") or "USD",
+        suffix="/Year",
+    )
     if not salary_text:
         salary_text = raw.get("compensation", "")
 

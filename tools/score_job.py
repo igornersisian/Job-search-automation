@@ -510,8 +510,8 @@ if __name__ == "__main__":
         print("Usage: python score_job.py '<job_json>'")
         sys.exit(1)
 
-    from supabase import create_client
-    sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+    from db import get_supabase
+    sb = get_supabase()
     profile_result = sb.table("profile").select("parsed").order("updated_at", desc=True).limit(1).execute()
     if not profile_result.data:
         print("No profile found in Supabase. Send your PDF to the Telegram bot first.")

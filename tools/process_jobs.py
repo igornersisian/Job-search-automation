@@ -23,13 +23,13 @@ import logging
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from supabase import create_client, Client, ClientOptions
 from dotenv import load_dotenv
 
 # Import sibling tools
 sys.path.insert(0, os.path.dirname(__file__))
 import traceback
 
+from db import get_supabase
 import apify_client
 from apify_client import SourceResult
 import run_apify_search
@@ -172,19 +172,6 @@ COMPANY_VARIANT_SIM_THRESHOLD = 0.75
 
 
 DEFAULT_SCORE_THRESHOLD = 70
-
-_supabase: Client | None = None
-
-
-def get_supabase() -> Client:
-    global _supabase
-    if _supabase is None:
-        _supabase = create_client(
-            os.environ["SUPABASE_URL"],
-            os.environ["SUPABASE_SERVICE_ROLE_KEY"],
-            options=ClientOptions(postgrest_client_timeout=30),
-        )
-    return _supabase
 
 
 # ---------------------------------------------------------------------------

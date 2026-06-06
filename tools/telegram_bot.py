@@ -20,7 +20,6 @@ from datetime import datetime, time as dt_time, timezone
 
 import httpx
 from openai import OpenAI
-from supabase import create_client, Client, ClientOptions
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -33,13 +32,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Auto-create tables on startup if DATABASE_URL is available
-try:
-    from setup_db import ensure_tables
-    ensure_tables()
-except Exception as _setup_err:
-    import logging as _log
-    _log.getLogger(__name__).warning(f"DB setup skipped: {_setup_err}")
+from db import get_supabase as _shared_supabase
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -49,7 +42,6 @@ logger = logging.getLogger(__name__)
 
 # --- Clients (lazy init so module can be imported without env vars set) ---
 _openai_client: OpenAI | None = None
-_supabase: Client | None = None
 
 
 def get_openai() -> OpenAI:
@@ -59,15 +51,11 @@ def get_openai() -> OpenAI:
     return _openai_client
 
 
-def get_supabase() -> Client:
-    global _supabase
-    if _supabase is None:
-        _supabase = create_client(
-            os.environ["SUPABASE_URL"],
-            os.environ["SUPABASE_SERVICE_ROLE_KEY"],
-            options=ClientOptions(postgrest_client_timeout=10),
-        )
-    return _supabase
+def get_supabase():
+    """Shared Supabase client with the bot's fail-fast timeout (10s) — kept
+    tighter than the pipeline's 30s so interactive commands don't hang on a
+    slow DB."""
+    return _shared_supabase(timeout=10)
 
 
 # In-memory active job context per chat_id

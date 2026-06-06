@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 import apify_client
+from normalise_utils import format_salary
 
 load_dotenv()
 
@@ -32,18 +33,13 @@ LIMIT = 100  # per keyword → cap / truncation threshold (raised 25→100; free
 
 def normalise_indeed(raw: dict) -> dict:
     """Map Indeed output fields to the shared job schema."""
-    salary_text = ""
     base = raw.get("baseSalary") or {}
-    if base:
-        lo = base.get("min")
-        hi = base.get("max")
-        currency = base.get("currencyCode") or "USD"
-        unit = (base.get("unitOfWork") or "").capitalize()
-        symbol = "$" if currency == "USD" else currency + " "
-        if lo and hi:
-            salary_text = f"{symbol}{lo:,}-{symbol}{hi:,}/{unit}".strip()
-        elif lo:
-            salary_text = f"{symbol}{lo:,}+/{unit}".strip()
+    unit = (base.get("unitOfWork") or "").capitalize()
+    salary_text = format_salary(
+        base.get("min"), base.get("max"),
+        currency=base.get("currencyCode") or "USD",
+        suffix=f"/{unit}",
+    )
 
     loc = raw.get("location") or {}
     parts = [loc.get("city"), loc.get("admin1Code"), loc.get("countryCode")]

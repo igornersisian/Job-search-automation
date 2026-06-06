@@ -19,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 import apify_client
+from normalise_utils import format_salary
 
 load_dotenv()
 
@@ -36,18 +37,13 @@ MAX_QUERIES = 5                 # actor rejects >5 (HTTP 400)
 
 def normalise_ats(raw: dict) -> dict:
     """Map ATS Jobs Search output to the shared job schema."""
-    salary_text = ""
     comp = raw.get("compensation") or {}
-    if comp:
-        lo = comp.get("min")
-        hi = comp.get("max")
-        currency = comp.get("currency") or "USD"
-        period = (comp.get("period") or "").capitalize()
-        symbol = "$" if currency == "USD" else currency + " "
-        if lo and hi:
-            salary_text = f"{symbol}{lo:,}-{symbol}{hi:,} {period}".strip()
-        elif lo:
-            salary_text = f"{symbol}{lo:,}+ {period}".strip()
+    period = (comp.get("period") or "").capitalize()
+    salary_text = format_salary(
+        comp.get("min"), comp.get("max"),
+        currency=comp.get("currency") or "USD",
+        suffix=f" {period}",
+    )
 
     locations = raw.get("locations") or []
     location_parts = []
