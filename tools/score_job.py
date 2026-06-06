@@ -111,6 +111,33 @@ def _extract_usage(response) -> dict:
     }
 
 
+# gpt-5-mini pricing, USD per 1M tokens. Defaults are the Flex/Batch tier
+# (~50% of standard: std input $0.25, output $2.00, cached $0.025 per 1M; see
+# openai.com/api/pricing). Override via env if rates change. Raw token counts are
+# logged alongside the cost too, so the $ figure is always recomputable.
+_OPENAI_PRICE_PER_1M = {
+    "input": float(os.environ.get("OPENAI_PRICE_INPUT", "0.125")),
+    "cached": float(os.environ.get("OPENAI_PRICE_CACHED", "0.0125")),
+    "output": float(os.environ.get("OPENAI_PRICE_OUTPUT", "1.00")),
+}
+
+
+def cost_from_usage(usage: dict | None) -> float:
+    """USD cost of one scoring call from its token usage (gpt-5-mini Flex tier).
+    output_tokens already includes reasoning tokens, which bill as output."""
+    if not usage:
+        return 0.0
+    prompt = usage.get("prompt_tokens", 0) or 0
+    cached = usage.get("cached_tokens", 0) or 0
+    output = usage.get("completion_tokens", 0) or 0
+    uncached = max(prompt - cached, 0)
+    return (
+        uncached / 1e6 * _OPENAI_PRICE_PER_1M["input"]
+        + cached / 1e6 * _OPENAI_PRICE_PER_1M["cached"]
+        + output / 1e6 * _OPENAI_PRICE_PER_1M["output"]
+    )
+
+
 def _openrouter_fallback(
     instructions: str,
     user_input: str,

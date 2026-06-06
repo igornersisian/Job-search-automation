@@ -158,6 +158,8 @@ def send_daily_summary(
     source_errors: dict | None = None,
     per_source: dict | None = None,
     total_cost: float | None = None,
+    openai_cost: float | None = None,
+    openai_calls: int | None = None,
 ) -> None:
     """Send a brief pipeline summary, including a per-source breakdown.
 
@@ -178,7 +180,14 @@ def send_daily_summary(
         if parts:
             dupe_detail = f" ({', '.join(parts)})"
 
-    cost_line = f" — Apify ${total_cost:.2f}" if total_cost is not None else ""
+    if total_cost is not None and openai_cost is not None:
+        calls = f", {openai_calls} scored" if openai_calls is not None else ""
+        cost_line = (f" — Apify ${total_cost:.2f} + OpenAI ${openai_cost:.2f}{calls} "
+                     f"= ${total_cost + openai_cost:.2f}")
+    elif total_cost is not None:
+        cost_line = f" — Apify ${total_cost:.2f}"
+    else:
+        cost_line = ""
     text = (
         f"*Job search run complete*{cost_line}\n"
         f"✅ Sent to you: {sent}\n"

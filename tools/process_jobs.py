@@ -38,7 +38,7 @@ import run_indeed_search
 import run_wellfound_search
 import run_remoteboards_search
 import run_ats_search
-from score_job import quick_score, is_excluded_by_title
+from score_job import quick_score, is_excluded_by_title, cost_from_usage
 from notify_telegram import send_job_card, send_daily_summary, send_message
 
 # Wellfound runs only in this UTC slot (low yield; see plan). None/other slots skip it.
@@ -473,6 +473,9 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
     totals: dict = {}
     keywords_used: list | None = None
     ok = True
+    # OpenAI scoring spend — aggregated across all scored candidates this run.
+    openai_usage = {"calls": 0, "prompt_tokens": 0, "cached_tokens": 0,
+                    "completion_tokens": 0, "cost_usd": 0.0}
 
     try:
         # Load profile
@@ -646,6 +649,13 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
             for future in as_completed(futures):
                 job, status = future.result()
                 rows_to_save.append(_job_row(job, status))
+                u = job.get("_usage")
+                if u:
+                    openai_usage["calls"] += 1
+                    openai_usage["prompt_tokens"] += u.get("prompt_tokens", 0) or 0
+                    openai_usage["cached_tokens"] += u.get("cached_tokens", 0) or 0
+                    openai_usage["completion_tokens"] += u.get("completion_tokens", 0) or 0
+                    openai_usage["cost_usd"] += cost_from_usage(u)
                 base = _base_source(job["source"])
                 if status == "sent":
                     sent += 1
@@ -667,15 +677,27 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
             errors_log.append({"source": "supabase", "stage": "save_jobs", "message": str(e)[:300]})
             ok = False
 
+        openai_cost = round(openai_usage["cost_usd"], 4)
         totals = {
             "fetched": sum(p["fetched"] for p in per_source.values()),
             "new": sum(p["new"] for p in per_source.values()),
             "sent": sent,
-            "cost_usd": total_cost,
+            "cost_usd": total_cost,                       # Apify only (kept for back-compat)
+            "apify_cost_usd": total_cost,
+            "openai_cost_usd": openai_cost,
+            "openai_calls": openai_usage["calls"],
+            "openai_tokens": {
+                "prompt": openai_usage["prompt_tokens"],
+                "cached": openai_usage["cached_tokens"],
+                "completion": openai_usage["completion_tokens"],
+            },
+            "total_cost_usd": round(total_cost + openai_cost, 4),
         }
         logger.info(
             f"Pipeline done — sent: {sent}, low score: {skipped_score}, "
-            f"excluded: {skipped_excluded}, dupes: {skipped_dupe}, Apify ${total_cost:.2f}"
+            f"excluded: {skipped_excluded}, dupes: {skipped_dupe}, "
+            f"Apify ${total_cost:.2f} + OpenAI ${openai_cost:.2f} "
+            f"({openai_usage['calls']} calls) = ${total_cost + openai_cost:.2f}"
         )
 
         source_errors = {name: p["error"] for name, p in per_source.items() if p["error"]}
@@ -691,6 +713,8 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
             source_errors=source_errors,
             per_source=per_source,
             total_cost=total_cost,
+            openai_cost=openai_cost,
+            openai_calls=openai_usage["calls"],
         )
 
     except Exception:
