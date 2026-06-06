@@ -110,19 +110,26 @@ def _exhausted_set() -> set[int]:
     return set(_load_state().get("exhausted", []))
 
 
-def get_active_token() -> tuple[int, str]:
-    """First non-exhausted token. Raises if none available."""
+def get_active_token(skip: set[int] | None = None) -> tuple[int, str]:
+    """First token slot that is neither persistently exhausted nor in `skip`.
+
+    `skip` is a per-call set of slots to step over *without* persisting them as
+    exhausted — used for transient network errors, which shouldn't burn a token
+    for the rest of the day (only real credit/auth failures do that).
+    Raises if none available.
+    """
     tokens = _load_tokens()
     if not tokens:
         raise RuntimeError(
             "No APIFY_API_TOKEN* env variables found. Add at least APIFY_API_TOKEN to .env."
         )
-    exhausted = _exhausted_set()
+    unavailable = _exhausted_set() | (skip or set())
     for idx, tok in enumerate(tokens):
-        if idx not in exhausted:
+        if idx not in unavailable:
             return idx, tok
     raise RuntimeError(
-        f"All {len(tokens)} Apify token slots are marked exhausted. "
+        f"All {len(tokens)} Apify token slots are unavailable "
+        f"(exhausted or skipped this call). "
         f"Top up an account or delete {STATE_FILE} to retry."
     )
 
@@ -203,11 +210,14 @@ def post(
 
     last_response: httpx.Response | None = None
     last_token: str = ""
+    # Slots stepped over for this call only (transient network errors). NOT
+    # persisted as exhausted — a DNS/timeout blip must not burn a token for the day.
+    tried: set[int] = set()
 
     # try up to N times where N == number of token slots
     for _ in range(len(tokens) + 1):
         try:
-            idx, tok = get_active_token()
+            idx, tok = get_active_token(skip=tried)
         except RuntimeError:
             # all exhausted — return the last response if we have one so the caller sees the actual API error
             if last_response is not None:
@@ -223,8 +233,9 @@ def post(
             logger.warning(
                 f"Apify POST network error on slot {idx + 1} (...{_fingerprint(tok)}): {e}"
             )
-            # network error isn't a credit issue — don't mark exhausted, just retry next slot
-            mark_exhausted(idx, f"network error: {e}")
+            # network error isn't a credit issue — skip this slot for THIS call only
+            # (no mark_exhausted), so a transient blip doesn't disable the token all day.
+            tried.add(idx)
             continue
 
         if is_credit_error(resp.status_code, resp.text) or is_invalid_token_error(
@@ -233,6 +244,7 @@ def post(
             mark_exhausted(
                 idx, f"HTTP {resp.status_code}: {resp.text[:200]}"
             )
+            tried.add(idx)  # also skip locally so the loop advances regardless
             last_response = resp
             last_token = tok
             continue
@@ -387,13 +399,17 @@ def run_actor_job(
         while time.time() < deadline:
             try:
                 pr = get(run_url, token, timeout=15)
+                if pr.status_code >= 400:
+                    poll_error = f"poll HTTP {pr.status_code}: {_redact((pr.text or '')[:300])}"
+                    break
+                run_data = pr.json()["data"]
             except Exception as e:
-                poll_error = f"poll error: {e}"
-                break
-            if pr.status_code >= 400:
-                poll_error = f"poll HTTP {pr.status_code}: {_redact((pr.text or '')[:300])}"
-                break
-            run_data = pr.json()["data"]
+                # Transient network/parse blip — the run is still alive on Apify.
+                # Retry until the deadline instead of dropping the whole source on
+                # one flaky round-trip (the self-hosted host flaps getaddrinfo).
+                logger.warning(f"[{source}] transient poll error (retrying): {e}")
+                time.sleep(poll_interval)
+                continue
             status = run_data.get("status")
             if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
                 break
