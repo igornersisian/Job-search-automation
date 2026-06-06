@@ -24,7 +24,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ACTOR_ID = "2rJKkhh7vjpX7pvjg"  # cheap_scraper/linkedin-job-scraper
-MAX_ITEMS = 150                 # our cap → also the truncation threshold
+MAX_ITEMS = 400                 # our cap → also the truncation threshold
+                                # (raised 150→400 to stop truncating the 24h window)
 
 
 def _published_at(lookback: int) -> str:

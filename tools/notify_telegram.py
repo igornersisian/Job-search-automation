@@ -195,7 +195,10 @@ def send_daily_summary(
             p = per_source.get(name)
             if not p:
                 continue
-            flag = " ⚠️cap" if p.get("capped") else ""
+            # "capped" = the source returned as many as our limit allowed, so
+            # there were probably MORE we didn't fetch (truncation). It is NOT a
+            # cap on what gets sent — sending is score-gated only.
+            flag = " ⚠️ hit our limit — more exist" if p.get("capped") else ""
             err = " ❌" if p.get("error") else ""
             lines.append(
                 f"• {name}: {p.get('fetched', 0)} fetched, {p.get('new', 0)} new, "

@@ -28,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ACTOR_ID = "5OaooRg0FxlRF0L1B"  # valig/glassdoor-jobs-scraper
-LIMIT = 25  # per keyword → cap / truncation threshold
+LIMIT = 100  # per keyword → cap / truncation threshold (raised 25→100; cheap source)
 
 
 def normalise_glassdoor(raw: dict) -> dict:

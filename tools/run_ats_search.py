@@ -29,7 +29,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ACTOR_ID = "NDli5o5pYKW1atJAY"  # jobo.world/ats-jobs-search
-PAGE_SIZE = 100                 # our cap → truncation threshold
+PAGE_SIZE = 100                 # results per page (actor max)
+MAX_PAGES = 3                   # ceiling → up to 300 results/run before we stop
 MAX_QUERIES = 5                 # actor rejects >5 (HTTP 400)
 
 
@@ -78,19 +79,36 @@ def normalise_ats(raw: dict) -> dict:
 
 
 def fetch(keywords: list[str], *, lookback: int = 86400) -> apify_client.SourceResult:
-    """Run the ATS actor for the first 5 keywords over the lookback window."""
+    """Run the ATS actor for the first 5 keywords over the lookback window,
+    paginating until a page comes back not-full (window exhausted) or we hit
+    MAX_PAGES. `capped` on the merged result means we stopped at the ceiling
+    with a still-full last page — i.e. there were more we didn't fetch."""
     since = (datetime.now(timezone.utc) - timedelta(seconds=lookback)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    actor_input = {
+    base = {
         "queries": keywords[:MAX_QUERIES],
         "is_remote": True,
         "posted_after": since,
         "page_size": PAGE_SIZE,
-        "page": 1,
     }
-    return apify_client.run_actor_job(
-        ACTOR_ID, actor_input,
-        source="ats", normalise=normalise_ats, cap=PAGE_SIZE,
-    )
+    pages: list[apify_client.SourceResult] = []
+    truncated = False
+    for page in range(1, MAX_PAGES + 1):
+        # cap=None per page: a full page is normal here, not a truncation signal —
+        # we decide truncation ourselves from whether the LAST page was full.
+        r = apify_client.run_actor_job(
+            ACTOR_ID, {**base, "page": page},
+            source="ats", normalise=normalise_ats, cap=None,
+        )
+        pages.append(r)
+        if r.error or r.fetched < PAGE_SIZE:
+            break  # actor error, or window exhausted (partial page) → stop
+        if page == MAX_PAGES:
+            truncated = True  # last allowed page was full → more remain beyond ceiling
+
+    merged = apify_client.merge_results("ats", pages)
+    merged.capped = truncated
+    logger.info(f"ATS paginated {len(pages)} page(s), {merged.fetched} fetched, truncated={truncated}")
+    return merged
 
 
 if __name__ == "__main__":

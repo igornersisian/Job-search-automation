@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ACTOR_ID = "valig~indeed-jobs-scraper"
-LIMIT = 25  # per keyword → cap / truncation threshold
+LIMIT = 100  # per keyword → cap / truncation threshold (raised 25→100; free source)
 
 
 def normalise_indeed(raw: dict) -> dict:
