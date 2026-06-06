@@ -168,17 +168,23 @@ def get_search_keywords() -> list[str] | None:
     return None
 
 
-def save_search_keywords(keywords: list[str]) -> None:
-    """Save search keywords into the profile's parsed JSONB."""
+def _update_profile_field(key: str, value) -> None:
+    """Set one field inside the profile's parsed JSONB (single row, id=1).
+    No-op (with a log) if no profile exists yet."""
     profile = get_profile()
     if not profile:
         logger.error("No profile found — upload resume first")
         return
-    profile["search_keywords"] = keywords
+    profile[key] = value
     get_supabase().table("profile").update({
         "parsed": profile,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", 1).execute()
+
+
+def save_search_keywords(keywords: list[str]) -> None:
+    """Save search keywords into the profile's parsed JSONB."""
+    _update_profile_field("search_keywords", keywords)
 
 
 WELLFOUND_VALID_ROLES = [
@@ -213,15 +219,7 @@ def get_wellfound_roles() -> list[str] | None:
 
 def save_wellfound_roles(roles: list[str]) -> None:
     """Save Wellfound roles into the profile's parsed JSONB."""
-    profile = get_profile()
-    if not profile:
-        logger.error("No profile found — upload resume first")
-        return
-    profile["wellfound_roles"] = roles
-    get_supabase().table("profile").update({
-        "parsed": profile,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", 1).execute()
+    _update_profile_field("wellfound_roles", roles)
 
 
 def get_score_threshold() -> int:
@@ -234,15 +232,7 @@ def get_score_threshold() -> int:
 
 def save_score_threshold(threshold: int) -> None:
     """Save score threshold into the profile's parsed JSONB."""
-    profile = get_profile()
-    if not profile:
-        logger.error("No profile found — upload resume first")
-        return
-    profile["score_threshold"] = threshold
-    get_supabase().table("profile").update({
-        "parsed": profile,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", 1).execute()
+    _update_profile_field("score_threshold", threshold)
 
 
 def get_custom_red_flags() -> list[str]:
@@ -255,15 +245,7 @@ def get_custom_red_flags() -> list[str]:
 
 def save_custom_red_flags(flags: list[str]) -> None:
     """Save custom dealbreakers into the profile's parsed JSONB."""
-    profile = get_profile()
-    if not profile:
-        logger.error("No profile found — upload resume first")
-        return
-    profile["custom_red_flags"] = flags
-    get_supabase().table("profile").update({
-        "parsed": profile,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", 1).execute()
+    _update_profile_field("custom_red_flags", flags)
 
 
 def get_excluded_title_keywords() -> list[str]:
@@ -276,15 +258,7 @@ def get_excluded_title_keywords() -> list[str]:
 
 def save_excluded_title_keywords(keywords: list[str]) -> None:
     """Save excluded title keywords into the profile's parsed JSONB."""
-    profile = get_profile()
-    if not profile:
-        logger.error("No profile found — upload resume first")
-        return
-    profile["excluded_title_keywords"] = keywords
-    get_supabase().table("profile").update({
-        "parsed": profile,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", 1).execute()
+    _update_profile_field("excluded_title_keywords", keywords)
 
 
 # ---------------------------------------------------------------------------

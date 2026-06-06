@@ -38,7 +38,7 @@ import run_indeed_search
 import run_wellfound_search
 import run_remoteboards_search
 import run_ats_search
-from score_job import quick_score, is_excluded_by_title, cost_from_usage
+from score_job import score_job, is_excluded_by_title, cost_from_usage
 from notify_telegram import send_job_card, send_daily_summary, send_message
 
 # Wellfound runs only in this UTC slot (low yield; see plan). None/other slots skip it.
@@ -427,12 +427,12 @@ def _process_single_job(job: dict, profile: dict, threshold: int) -> tuple[dict,
     Runs in a worker thread — no shared mutable state.
     """
     try:
-        score, breakdown = quick_score(job, profile)
+        score_job(job, profile)  # mutates job in place: score, match_summary, red_flags, _usage
     except Exception as e:
         logger.error(f"Scoring failed for {job['title']}: {e}")
         return job, "score_error"
 
-    # quick_score now also sets match_summary + red_flags on the job dict
+    score = job.get("score", 0)
     logger.info(f"[{score}/100] {job['title']} @ {job['company']} ({job['source']})")
 
     if score < threshold:
@@ -550,10 +550,19 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
         dupes_local = 0           # same id twice this run
         dupes_fuzzy = 0           # same title+company, similar description (this run)
 
-        all_raw_ids = [r.get("id", "") for r in raw_jobs if r.get("id")]
+        # Normalise every raw job once, and derive the dedup fingerprint
+        # (norm_title|norm_company) once too — both were previously recomputed
+        # 2–4× per job across the fingerprint pass and the loop below.
+        jobs = [normalise_job(r) for r in raw_jobs]
+        norm_keys = [
+            (_normalise_title(j["title"]), _normalise_company(j["company"]))
+            for j in jobs
+        ]
+        all_fps = [f"{t}|{c}" for t, c in norm_keys]
+
+        all_raw_ids = [j["id"] for j in jobs if j["id"]]
         already_seen_ids = fetch_existing_ids(all_raw_ids) if all_raw_ids else set()
         # Cross-run fuzzy: pull recent fingerprints once (degrades gracefully if column missing)
-        all_fps = [_fingerprint(normalise_job(r)) for r in raw_jobs]
         recent_fp_map = fetch_recent_fingerprints(all_fps)
         logger.info(
             f"Batch dedup: {len(already_seen_ids)} exact-id seen / {len(all_raw_ids)} ids; "
@@ -564,8 +573,7 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
         fuzzy_groups: dict[str, list[dict]] = {}
         company_jobs: dict[str, list[dict]] = {}
 
-        for raw in raw_jobs:
-            job = normalise_job(raw)
+        for job, (norm_title, norm_company), dedup_key in zip(jobs, norm_keys, all_fps):
             if not job["id"] or not job["title"]:
                 continue
 
@@ -576,10 +584,6 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
                 dupes_local += 1
                 continue
             processed_ids.add(job["id"])
-
-            norm_title = _normalise_title(job["title"])
-            norm_company = _normalise_company(job["company"])
-            dedup_key = f"{norm_title}|{norm_company}"
 
             is_duplicate = False
 

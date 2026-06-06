@@ -505,12 +505,6 @@ def score_job(
     return job
 
 
-def quick_score(job: dict, profile: dict) -> tuple[int, dict]:
-    """Score a job and return (score, breakdown). Also sets match_summary/red_flags on the job dict."""
-    enriched = score_job(job, profile)
-    return enriched["score"], enriched["score_breakdown"]
-
-
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python score_job.py '<job_json>'")
