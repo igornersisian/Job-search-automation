@@ -186,6 +186,10 @@ WELLFOUND_VALID_ROLES = [
     "Frontend Engineer", "Backend Engineer", "Full-Stack Engineer", "Software Architect",
     "Embedded Engineer", "Data Engineer", "Security Engineer", "Machine Learning Engineer",
     "Engineering Manager", "QA Engineer", "DevOps", "Data Scientist",
+    # AI/automation roles — proven to exist as Wellfound categories (probed 2026-06-06).
+    # The generic categories above pull traditional senior-SWE that score ~0 for an
+    # AI-automation profile; these surface AI/ML/automation jobs that actually match.
+    "AI Engineer", "Artificial Intelligence Engineer", "Automation Engineer",
     "Designer", "User Researcher", "Visual Designer", "Creative Director",
     "Graphic Designer", "Product Designer", "Design Manager",
     "Product Manager",
