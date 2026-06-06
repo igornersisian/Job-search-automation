@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from db import get_supabase as _shared_supabase
+from score_job import score_job  # same strict rubric the daily pipeline uses
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -332,37 +333,37 @@ def scrape_job_page(url: str) -> str:
     return " ".join(extractor.texts)[:8000]  # cap at 8k chars
 
 
-def analyze_job_with_openai(job_text: str, profile: dict) -> dict:
-    """Analyze a job posting against the user's profile."""
-    response = get_openai().chat.completions.create(
-        model="gpt-4.1-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a career advisor. Analyze the job posting against the candidate's profile. "
-                    "Return a JSON object with:\n"
-                    "- title: string (job title)\n"
-                    "- company: string\n"
-                    "- score: int 0-100 (fit score)\n"
-                    "- match_summary: string (what matches well, 1-2 sentences)\n"
-                    "- red_flags: list of strings (concerns or mismatches)\n"
-                    "- typical_qa: list of objects [{question, answer}] "
-                    "  (3-5 likely application questions with suggested answers based on candidate profile)\n"
-                    "Return only valid JSON."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"CANDIDATE PROFILE:\n{json.dumps(profile, indent=2)}\n\n"
-                    f"JOB POSTING:\n{job_text}"
-                ),
-            },
-        ],
+def extract_job_prep(job_text: str, profile: dict) -> dict:
+    """gpt-5-mini: pull the job's title/company and draft likely application Q&A.
+
+    The fit SCORE is NOT produced here — /job scores through the same score_job
+    rubric (gpt-5-mini) the daily pipeline uses, so the number is consistent
+    across both entry points. This call only adds the title/company and the
+    application-prep answers.
+    """
+    instructions = (
+        "You extract structured info from a job posting and draft application answers. "
+        "Return ONLY a JSON object with:\n"
+        "- title: string (job title)\n"
+        "- company: string\n"
+        "- typical_qa: list of [{question, answer}] — 3-5 likely application "
+        "questions with concise suggested answers, written in first person as the "
+        "candidate and grounded strictly in the candidate profile.\n"
+        "Return only valid JSON."
     )
-    return json.loads(response.choices[0].message.content)
+    user_input = (
+        f"CANDIDATE PROFILE:\n{json.dumps(profile, indent=2)}\n\n"
+        f"JOB POSTING:\n{job_text}"
+    )
+    resp = get_openai().responses.create(
+        model="gpt-5-mini",
+        instructions=instructions,
+        input=user_input,
+        text={"format": {"type": "json_object"}},
+        reasoning={"effort": "minimal"},
+        store=False,
+    )
+    return json.loads(resp.output_text)
 
 
 # ---------------------------------------------------------------------------
@@ -712,29 +713,44 @@ async def cmd_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.edit_text("Analyzing...")
 
     try:
-        analysis = analyze_job_with_openai(job_text, profile)
+        prep = extract_job_prep(job_text, profile)
     except Exception as e:
         await msg.edit_text(f"Analysis failed: {e}")
         return
 
-    # Store as active job context
-    analysis["url"] = url
-    analysis["description"] = job_text[:3000]
-    active_jobs[update.effective_chat.id] = analysis
+    # Score with the SAME rubric as the daily pipeline (gpt-5-mini) so /job and
+    # the scheduled run agree on the number. score_job reads the full description.
+    job = {
+        "title": prep.get("title", ""),
+        "company": prep.get("company", ""),
+        "description": job_text,
+        "url": url,
+        "source": "manual",
+    }
+    try:
+        score_job(job, profile)  # mutates job: score, match_summary, red_flags, score_breakdown
+    except Exception as e:
+        await msg.edit_text(f"Scoring failed: {e}")
+        return
 
-    score = analysis.get("score", 0)
+    # Store as active job context (truncate description to the prompt budget)
+    job["typical_qa"] = prep.get("typical_qa", [])
+    job["description"] = job_text[:3000]
+    active_jobs[update.effective_chat.id] = job
+
+    score = job.get("score", 0)
     score_emoji = "✅" if score >= 70 else "⚠️" if score >= 50 else "❌"
-    red_flags = analysis.get("red_flags", [])
+    red_flags = job.get("red_flags", [])
     flags_text = "\n".join(f"⚠️ {f}" for f in red_flags) if red_flags else "None"
 
     qa_preview = ""
-    for qa in analysis.get("typical_qa", [])[:2]:
+    for qa in job.get("typical_qa", [])[:2]:
         qa_preview += f"\n\n*Q:* {qa.get('question')}\n*A:* _{qa.get('answer', '')[:200]}_"
 
     await msg.edit_text(
-        f"*{analysis.get('title')} @ {analysis.get('company')}*\n"
+        f"*{job.get('title')} @ {job.get('company')}*\n"
         f"Score: {score}/100 {score_emoji}\n\n"
-        f"*Match:* {analysis.get('match_summary')}\n\n"
+        f"*Match:* {job.get('match_summary')}\n\n"
         f"*Red flags:* {flags_text}"
         f"{qa_preview}\n\n"
         f"_Job set as active context. Ask me anything about it._",
