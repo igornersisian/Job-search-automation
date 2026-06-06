@@ -263,31 +263,31 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 
 
 def parse_resume_with_openai(raw_text: str) -> dict:
-    """Use OpenAI to extract structured profile from resume text."""
-    response = get_openai().chat.completions.create(
-        model="gpt-4.1-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a resume parser. Extract structured information from the resume text "
-                    "and return a JSON object with these fields:\n"
-                    "- name: string\n"
-                    "- title: string (current/desired job title)\n"
-                    "- summary: string (2-3 sentence professional summary)\n"
-                    "- skills: list of strings (technical skills, tools, platforms)\n"
-                    "- experience: list of objects [{company, role, duration, highlights}]\n"
-                    "- projects: list of objects [{name, description, tech_stack}]\n"
-                    "- languages: list of strings\n"
-                    "- education: list of objects [{institution, degree, years}]\n"
-                    "Return only valid JSON, no extra text."
-                ),
-            },
-            {"role": "user", "content": raw_text},
-        ],
+    """Use gpt-5-mini to extract a structured profile from resume text."""
+    instructions = (
+        "You are a resume parser. Extract structured information from the resume text "
+        "and return a JSON object with these fields:\n"
+        "- name: string\n"
+        "- title: string (current/desired job title)\n"
+        "- summary: string (2-3 sentence professional summary)\n"
+        "- skills: list of strings (technical skills, tools, platforms)\n"
+        "- experience: list of objects [{company, role, duration, highlights}]\n"
+        "- projects: list of objects [{name, description, tech_stack}]\n"
+        "- languages: list of strings\n"
+        "- education: list of objects [{institution, degree, years}]\n"
+        "Return only valid JSON, no extra text."
     )
-    return json.loads(response.choices[0].message.content)
+    resp = get_openai().responses.create(
+        model="gpt-5-mini",
+        instructions=instructions,
+        # The Responses API requires the word "json" in the input itself when
+        # text.format is json_object — not just in the instructions.
+        input=f"Parse this resume and return JSON per the instructions:\n\n{raw_text}",
+        text={"format": {"type": "json_object"}},
+        reasoning={"effort": "minimal"},
+        store=False,
+    )
+    return json.loads(resp.output_text)
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +353,8 @@ def extract_job_prep(job_text: str, profile: dict) -> dict:
     )
     user_input = (
         f"CANDIDATE PROFILE:\n{json.dumps(profile, indent=2)}\n\n"
-        f"JOB POSTING:\n{job_text}"
+        f"JOB POSTING:\n{job_text}\n\n"
+        "Return JSON per the instructions."  # 'json' must appear in the input
     )
     resp = get_openai().responses.create(
         model="gpt-5-mini",
@@ -852,15 +853,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     system_prompt = "\n".join(system_parts)
 
     try:
-        response = get_openai().chat.completions.create(
-            model="gpt-4.1",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            max_tokens=600,
+        response = get_openai().responses.create(
+            model="gpt-5-mini",
+            instructions=system_prompt,
+            input=user_text,
+            reasoning={"effort": "minimal"},
+            max_output_tokens=1500,  # room for minimal reasoning + a concise reply
+            store=False,
         )
-        reply = response.choices[0].message.content
+        reply = response.output_text
     except Exception as e:
         reply = f"Error: {e}"
 
