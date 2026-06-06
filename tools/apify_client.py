@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Callable
 
 import httpx
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -72,7 +73,7 @@ def _load_tokens() -> list[str]:
     return tokens
 
 
-def _fingerprint(token: str) -> str:
+def _mask_token(token: str) -> str:
     """Last 4 chars of the token, safe to log."""
     if not token:
         return "????"
@@ -143,7 +144,7 @@ def mark_exhausted(index: int, reason: str = "") -> None:
     state["exhausted"] = sorted(exhausted)
     _save_state(state)
     tokens = _load_tokens()
-    fp = _fingerprint(tokens[index]) if index < len(tokens) else "????"
+    fp = _mask_token(tokens[index]) if index < len(tokens) else "????"
     logger.warning(
         f"Apify token slot {index + 1} (...{fp}) marked exhausted. Reason: {reason[:200]}"
     )
@@ -231,7 +232,7 @@ def post(
             resp = httpx.post(url, json=json_body, params=params, timeout=timeout)
         except httpx.HTTPError as e:
             logger.warning(
-                f"Apify POST network error on slot {idx + 1} (...{_fingerprint(tok)}): {e}"
+                f"Apify POST network error on slot {idx + 1} (...{_mask_token(tok)}): {e}"
             )
             # network error isn't a credit issue — skip this slot for THIS call only
             # (no mark_exhausted), so a transient blip doesn't disable the token all day.
@@ -251,7 +252,7 @@ def post(
 
         if resp.status_code < 400:
             logger.info(
-                f"Apify POST ok via slot {idx + 1}/{len(tokens)} (...{_fingerprint(tok)})"
+                f"Apify POST ok via slot {idx + 1}/{len(tokens)} (...{_mask_token(tok)})"
             )
         return resp, tok
 
@@ -292,7 +293,7 @@ def active_slot_summary() -> str:
         idx, tok = get_active_token()
     except RuntimeError as e:
         return f"NO ACTIVE TOKEN: {e}"
-    return f"slot {idx + 1}/{len(_load_tokens())} (...{_fingerprint(tok)})"
+    return f"slot {idx + 1}/{len(_load_tokens())} (...{_mask_token(tok)})"
 
 
 _TOKEN_PARAM_RE = re.compile(r"(token=)[^&\s'\"]+")
@@ -458,7 +459,7 @@ def run_actor_job(
         report_run_failure(token, status or "", status_msg)
         if looks_like_credit_failure_message(status_msg) and attempt < max_attempts:
             logger.warning(
-                f"[{source}] credit-fail mid-run on slot {_fingerprint(token)} "
+                f"[{source}] credit-fail mid-run on slot {_mask_token(token)} "
                 f"(attempt {attempt}) — retrying on next token"
             )
             res.error = f"run {status} (credit): {status_msg[:200]}"
@@ -470,6 +471,37 @@ def run_actor_job(
     if res.error:
         logger.error(f"[{source}] FAILED after {res.attempts} attempt(s): {res.error}")
     return res
+
+
+def fan_out_keywords(
+    actor_id: str,
+    keywords: list[str],
+    build_input: Callable[[str], dict],
+    *,
+    source: str,
+    normalise: Callable[[dict], dict],
+    cap: int | None,
+    max_workers: int = 5,
+) -> SourceResult:
+    """Run one actor job per keyword in parallel and merge the results.
+
+    Shared by per-keyword sources (Glassdoor, Indeed, RemoteBoards) that fan a
+    single search out into one actor run per keyword. `build_input(keyword)`
+    returns the actor input for that keyword; empties are dropped and an empty
+    keyword list yields an empty SourceResult.
+    """
+    kws = [k for k in (keywords or []) if k]
+    if not kws:
+        return SourceResult(source=source)
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(kws))) as ex:
+        results = list(ex.map(
+            lambda kw: run_actor_job(
+                actor_id, build_input(kw),
+                source=source, normalise=normalise, cap=cap,
+            ),
+            kws,
+        ))
+    return merge_results(source, results)
 
 
 def merge_results(source: str, results: list[SourceResult]) -> SourceResult:

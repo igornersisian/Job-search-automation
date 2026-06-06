@@ -10,23 +10,18 @@ Exposes `fetch(keywords, *, lookback)` -> apify_client.SourceResult.
 """
 
 import json
-import logging
 import math
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 
 import apify_client
 from normalise_utils import format_salary
+from log_setup import get_logger
 
 load_dotenv()
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 ACTOR_ID = "5OaooRg0FxlRF0L1B"  # valig/glassdoor-jobs-scraper
 LIMIT = 100  # per keyword → cap / truncation threshold (raised 25→100; cheap source)
@@ -67,27 +62,14 @@ def normalise_glassdoor(raw: dict) -> dict:
     }
 
 
-def _fetch_one(keyword: str, days_old: int) -> apify_client.SourceResult:
-    actor_input = {
-        "keywords": keyword,
-        "location": "United States",
-        "daysOld": days_old,
-        "limit": LIMIT,
-    }
-    return apify_client.run_actor_job(
-        ACTOR_ID, actor_input,
-        source="glassdoor", normalise=normalise_glassdoor, cap=LIMIT,
-    )
-
-
 def fetch(keywords: list[str], *, lookback: int = 86400) -> apify_client.SourceResult:
     """Run one Glassdoor search per keyword in parallel and merge."""
-    if not keywords:
-        return apify_client.SourceResult(source="glassdoor")
     days_old = max(1, math.ceil(lookback / 86400))  # whole days; min 1
-    with ThreadPoolExecutor(max_workers=min(5, len(keywords))) as ex:
-        results = list(ex.map(lambda kw: _fetch_one(kw, days_old), keywords))
-    return apify_client.merge_results("glassdoor", results)
+    return apify_client.fan_out_keywords(
+        ACTOR_ID, keywords,
+        lambda kw: {"keywords": kw, "location": "United States", "daysOld": days_old, "limit": LIMIT},
+        source="glassdoor", normalise=normalise_glassdoor, cap=LIMIT,
+    )
 
 
 if __name__ == "__main__":

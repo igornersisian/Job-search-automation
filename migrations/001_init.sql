@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     score         INTEGER,
     match_summary TEXT,
     red_flags     TEXT,
+    score_breakdown TEXT,
     typical_qa    TEXT,
     status        TEXT,
     created_at    TIMESTAMPTZ DEFAULT NOW()

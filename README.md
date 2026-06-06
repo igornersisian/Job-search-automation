@@ -5,7 +5,7 @@ A self-hosted job search assistant that scrapes 20+ job platforms daily, scores 
 ## How it works
 
 1. **Send your resume PDF** to the Telegram bot — it parses it with OpenAI and stores a structured profile in Supabase.
-2. **Every weekday at 9:00 UTC**, the bot fetches remote jobs from 6 sources (20+ platforms) in parallel, deduplicates, scores each one against your profile, and sends high-scoring cards to Telegram.
+2. **4×/day at 03:00 / 09:00 / 15:00 / 21:00 UTC**, the bot fetches remote jobs from 6 sources (20+ platforms) in parallel, deduplicates, scores each one against your profile, and sends high-scoring cards to Telegram.
 3. **In the bot**, you can ask follow-up questions, analyze any job URL with `/job <url>`, tune scoring with `/threshold` and `/redflags`, configure search keywords, or get cover letter help.
 
 ## Sources
@@ -18,7 +18,7 @@ All scrapers run in parallel via Apify:
 | Glassdoor | Glassdoor | `valig/glassdoor-jobs-scraper` |
 | Indeed | Indeed | `valig/indeed-jobs-scraper` |
 | Wellfound | Wellfound (AngelList) | `clearpath/wellfound-api-ppe` |
-| RemoteBoards | RemoteOK, Remotive, WeWorkRemotely | `zyncodltd/JobsFlow` |
+| RemoteBoards | RemoteOK, Remotive, WeWorkRemotely | `silicatelabs/JobsFlow` |
 | ATS | Greenhouse, Lever, Workday, Ashby, Workable, SmartRecruiters, BambooHR, Rippling, Personio, JazzHR, Breezy HR, Recruitee, Polymer | `jobo.world/ats-jobs-search` |
 
 ## Architecture
@@ -35,7 +35,9 @@ tools/
   run_ats_search.py          — 13 ATS platforms (Greenhouse, Lever, Workday, etc.)
   score_job.py               — OpenAI scoring + enrichment (OpenRouter fallback)
   notify_telegram.py         — Telegram job card sender
-  setup_db.py                — Auto-create Supabase tables on startup
+  apify_client.py            — Shared Apify runner (token rotation, retry, cost capture)
+  openai_client.py           — Shared OpenAI client + Responses helper
+  db.py / log_setup.py       — Shared Supabase client / logging setup
 
 workflows/
   daily_job_search.md        — Detailed pipeline SOP
@@ -51,7 +53,7 @@ Normalise to shared schema
     ↓
 Dedup: cross-run (Supabase) → same-run (ID) → fuzzy (title+company+description)
     ↓
-Junior/intern + excluded-title filter
+Excluded-title filter (user-configured via /excluded)
     ↓
 Quick score (OpenAI, 0-100; OpenRouter fallback)
     ↓
@@ -78,18 +80,15 @@ Create a `.env` file with the following variables:
 | `OPENROUTER_API_KEY` | OpenRouter API key (fallback for scoring) |
 | `SUPABASE_URL` | Your Supabase project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key (not the anon key) |
-| `APIFY_API_TOKEN` | Apify API token |
-| `DATABASE_URL` | *(Optional)* Direct Postgres URL — enables auto table creation on startup |
+| `APIFY_API_TOKEN` | Apify API token (add `APIFY_API_TOKEN2`, `3`, … to rotate across accounts) |
+| `OPENAI_PRICE_*` | *(Optional)* Override scoring price-per-1M rates (`OPENAI_PRICE_INPUT` / `_CACHED` / `_OUTPUT`) |
 
 ## Database setup
 
-### Option A — Automatic (with DATABASE_URL)
+Run the migration files in [migrations/](migrations/) in your Supabase SQL editor, in order:
 
-Add `DATABASE_URL` to your environment. Tables are created automatically when the bot starts.
-
-### Option B — Manual (Supabase SQL editor)
-
-Run the contents of [migrations/001_init.sql](migrations/001_init.sql) in your Supabase SQL editor.
+1. `001_init.sql` — base `profile` and `jobs` tables
+2. `002_observability_and_dedup.sql` — `pipeline_runs` audit log + `jobs.fingerprint` for cross-run dedup
 
 ## Running locally
 
@@ -105,7 +104,7 @@ python tools/telegram_bot.py
 3. In **Environment** tab, add all variables from the table above.
 4. Click **Deploy**.
 
-The bot starts long-polling immediately. The daily pipeline runs on a built-in scheduler (weekdays at 9:00 UTC) — no separate cron container needed.
+The bot starts long-polling immediately. The pipeline runs on a built-in scheduler (4×/day at 03:00 / 09:00 / 15:00 / 21:00 UTC) — no separate cron container needed.
 
 ## Bot commands
 
@@ -114,7 +113,7 @@ The bot starts long-polling immediately. The daily pipeline runs on a built-in s
 | Send PDF | Upload resume to set up profile |
 | `/status` | Check current profile |
 | `/job <url>` | Analyze any job listing |
-| `/fetch` | Manually trigger the job search pipeline |
+| `/fetch_jobs` | Manually trigger the job search pipeline |
 | `/threshold <N>` | Set minimum score (default 70) |
 | `/keywords` | Set or view search keywords |
 | `/wellfound` | Configure Wellfound role filters |

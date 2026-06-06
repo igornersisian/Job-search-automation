@@ -13,21 +13,17 @@ Exposes `fetch(keywords, *, lookback, profile)` -> apify_client.SourceResult.
 
 import json
 import re
-import logging
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
 import apify_client
 from normalise_utils import format_salary
+from log_setup import get_logger
 
 load_dotenv()
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 ACTOR_ID = "clearpath~wellfound-api-ppe"
 

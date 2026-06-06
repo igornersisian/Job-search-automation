@@ -21,20 +21,21 @@ import os
 import sys
 import json
 import time
-import logging
 
 from openai import OpenAI
 from dotenv import load_dotenv
 
+try:
+    from openai_client import get_openai          # production: tools/ is on sys.path
+    from log_setup import get_logger
+except ModuleNotFoundError:                        # experiments import this as tools.score_job
+    from tools.openai_client import get_openai
+    from tools.log_setup import get_logger
+
 load_dotenv()
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-_openai_client: OpenAI | None = None
 _openrouter_client: OpenAI | None = None
 
 # Stable key so OpenAI routes repeated scoring calls to the same cache shard.
@@ -42,12 +43,9 @@ _openrouter_client: OpenAI | None = None
 # becomes useless the moment the prefix shifts by a single token.
 PROMPT_CACHE_KEY = "score_job_v1"
 
-
-def get_openai() -> OpenAI:
-    global _openai_client
-    if _openai_client is None:
-        _openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    return _openai_client
+# Default minimum score to surface a job, when the profile sets no override.
+# Shared by the pipeline and the bot so the fallback lives in one place.
+DEFAULT_SCORE_THRESHOLD = 70
 
 
 def _get_openrouter() -> OpenAI | None:
@@ -143,11 +141,12 @@ def _openrouter_fallback(
     user_input: str,
     model: str,
     reasoning_effort: str | None,
-) -> tuple[str, dict]:
-    """Last-resort fallback through OpenRouter's chat.completions endpoint."""
+) -> tuple[str, dict] | None:
+    """Last-resort fallback through OpenRouter's chat.completions endpoint.
+    Returns None when no OpenRouter key is configured."""
     client = _get_openrouter()
     if client is None:
-        return None  # type: ignore[return-value]
+        return None
     or_kwargs: dict = {
         "model": f"openai/{model}",
         "messages": [
@@ -477,10 +476,12 @@ def score_job(
         service_tier=service_tier,
     )
     latency_ms = int((time.perf_counter() - t0) * 1000)
-    result = json.loads(json_text)
-
+    # Record usage BEFORE parsing: the call is already billed, so a malformed-JSON
+    # response must still count toward the run's token/cost totals.
     job["_usage"] = usage
     job["_latency_ms"] = latency_ms
+
+    result = json.loads(json_text)
 
     job["match_summary"] = result.get("match_summary", "")
     job["red_flags"] = result.get("red_flags", [])

@@ -13,21 +13,17 @@ Exposes `fetch(keywords, *, lookback)` -> apify_client.SourceResult.
 """
 
 import json
-import logging
 from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 
 import apify_client
 from normalise_utils import format_salary
+from log_setup import get_logger
 
 load_dotenv()
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 ACTOR_ID = "NDli5o5pYKW1atJAY"  # jobo.world/ats-jobs-search
 PAGE_SIZE = 100                 # results per page (actor max)

@@ -10,18 +10,15 @@ Usage:
 import os
 import sys
 import json
-import logging
 
 import httpx
 from dotenv import load_dotenv
 
+from log_setup import get_logger
+
 load_dotenv()
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 def _telegram_api() -> str:
     return f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}"

@@ -9,19 +9,15 @@ The start/poll/fetch/retry/cap/cost lifecycle lives in apify_client.run_actor_jo
 """
 
 import json
-import logging
 
 from dotenv import load_dotenv
 
 import apify_client
+from log_setup import get_logger
 
 load_dotenv()
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 ACTOR_ID = "2rJKkhh7vjpX7pvjg"  # cheap_scraper/linkedin-job-scraper
 MAX_ITEMS = 400                 # our cap → also the truncation threshold

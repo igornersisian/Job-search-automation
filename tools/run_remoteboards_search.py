@@ -16,20 +16,15 @@ Exposes `fetch(keywords, *, lookback, profile)` -> apify_client.SourceResult.
 """
 
 import json
-import logging
-from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 
 import apify_client
+from log_setup import get_logger
 
 load_dotenv()
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 ACTOR_ID = "l09aaDKNa1G3SVFzr"  # silicatelabs/JobsFlow
 MAX_JOBS = 50           # per keyword
@@ -52,23 +47,15 @@ def normalise_remoteboards(raw: dict) -> dict:
     }
 
 
-def _fetch_one(keyword: str) -> apify_client.SourceResult:
-    actor_input = {"maxJobs": MAX_JOBS, "searchKeywords": keyword}
-    return apify_client.run_actor_job(
-        ACTOR_ID, actor_input,
-        source="remoteboards", normalise=normalise_remoteboards, cap=MAX_JOBS,
-    )
-
-
 def fetch(keywords: list[str], *, lookback: int = 86400, profile: dict | None = None) -> apify_client.SourceResult:
     """One JobsFlow run per keyword (parallel) over the remote boards, merged.
     lookback unused (actor has no time filter)."""
     kws = [k for k in (keywords or []) if k][:MAX_KEYWORDS]
-    if not kws:
-        return apify_client.SourceResult(source="remoteboards")
-    with ThreadPoolExecutor(max_workers=min(5, len(kws))) as ex:
-        results = list(ex.map(_fetch_one, kws))
-    return apify_client.merge_results("remoteboards", results)
+    return apify_client.fan_out_keywords(
+        ACTOR_ID, kws,
+        lambda kw: {"maxJobs": MAX_JOBS, "searchKeywords": kw},
+        source="remoteboards", normalise=normalise_remoteboards, cap=MAX_JOBS,
+    )
 
 
 if __name__ == "__main__":

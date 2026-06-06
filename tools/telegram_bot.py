@@ -14,12 +14,10 @@ import sys
 import io
 import re
 import json
-import logging
 import asyncio
 from datetime import datetime, time as dt_time, timezone
 
 import httpx
-from openai import OpenAI
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -33,24 +31,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from db import get_supabase as _shared_supabase
-from score_job import score_job  # same strict rubric the daily pipeline uses
+from score_job import score_job, DEFAULT_SCORE_THRESHOLD  # same strict rubric the daily pipeline uses
+from openai_client import respond
+from log_setup import get_logger
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# --- Clients (lazy init so module can be imported without env vars set) ---
-_openai_client: OpenAI | None = None
-
-
-def get_openai() -> OpenAI:
-    global _openai_client
-    if _openai_client is None:
-        _openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    return _openai_client
-
+logger = get_logger(__name__)
 
 def get_supabase():
     """Shared Supabase client with the bot's fail-fast timeout (10s) — kept
@@ -212,11 +197,11 @@ def save_wellfound_roles(roles: list[str]) -> None:
 
 
 def get_score_threshold() -> int:
-    """Return the score threshold from profile, or default 70."""
+    """Return the score threshold from profile, or the shared default."""
     profile = get_profile()
     if profile:
-        return profile.get("score_threshold") or 70
-    return 70
+        return profile.get("score_threshold") or DEFAULT_SCORE_THRESHOLD
+    return DEFAULT_SCORE_THRESHOLD
 
 
 def save_score_threshold(threshold: int) -> None:
@@ -277,17 +262,14 @@ def parse_resume_with_openai(raw_text: str) -> dict:
         "- education: list of objects [{institution, degree, years}]\n"
         "Return only valid JSON, no extra text."
     )
-    resp = get_openai().responses.create(
-        model="gpt-5-mini",
-        instructions=instructions,
-        # The Responses API requires the word "json" in the input itself when
-        # text.format is json_object — not just in the instructions.
-        input=f"Parse this resume and return JSON per the instructions:\n\n{raw_text}",
-        text={"format": {"type": "json_object"}},
-        reasoning={"effort": "minimal"},
-        store=False,
+    # The Responses API requires the word "json" in the input itself when
+    # the format is json_object — not just in the instructions.
+    output = respond(
+        instructions,
+        f"Parse this resume and return JSON per the instructions:\n\n{raw_text}",
+        json_mode=True,
     )
-    return json.loads(resp.output_text)
+    return json.loads(output)
 
 
 # ---------------------------------------------------------------------------
@@ -310,22 +292,24 @@ def scrape_job_page(url: str) -> str:
     # Strip HTML tags with a simple approach
     from html.parser import HTMLParser
 
+    SKIP_TAGS = ("script", "style", "nav", "header", "footer")
+
     class TextExtractor(HTMLParser):
         def __init__(self):
             super().__init__()
             self.texts = []
-            self._skip = False
+            self._skip_depth = 0  # counter, so nested/overlapping skip tags don't end early
 
         def handle_starttag(self, tag, attrs):
-            if tag in ("script", "style", "nav", "header", "footer"):
-                self._skip = True
+            if tag in SKIP_TAGS:
+                self._skip_depth += 1
 
         def handle_endtag(self, tag):
-            if tag in ("script", "style", "nav", "header", "footer"):
-                self._skip = False
+            if tag in SKIP_TAGS and self._skip_depth > 0:
+                self._skip_depth -= 1
 
         def handle_data(self, data):
-            if not self._skip and data.strip():
+            if self._skip_depth == 0 and data.strip():
                 self.texts.append(data.strip())
 
     extractor = TextExtractor()
@@ -356,15 +340,7 @@ def extract_job_prep(job_text: str, profile: dict) -> dict:
         f"JOB POSTING:\n{job_text}\n\n"
         "Return JSON per the instructions."  # 'json' must appear in the input
     )
-    resp = get_openai().responses.create(
-        model="gpt-5-mini",
-        instructions=instructions,
-        input=user_input,
-        text={"format": {"type": "json_object"}},
-        reasoning={"effort": "minimal"},
-        store=False,
-    )
-    return json.loads(resp.output_text)
+    return json.loads(respond(instructions, user_input, json_mode=True))
 
 
 # ---------------------------------------------------------------------------
@@ -816,9 +792,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     profile = get_profile()
 
     # If user replies to a job card message, load that job as active context
-    reply = update.message.reply_to_message
-    if reply and reply.text:
-        job_url = _extract_job_url_from_message(reply)
+    replied_msg = update.message.reply_to_message
+    if replied_msg and replied_msg.text:
+        job_url = _extract_job_url_from_message(replied_msg)
         if job_url:
             job_from_db = get_job_by_url(job_url)
             if job_from_db:
@@ -853,19 +829,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     system_prompt = "\n".join(system_parts)
 
     try:
-        response = get_openai().responses.create(
-            model="gpt-5-mini",
-            instructions=system_prompt,
-            input=user_text,
-            reasoning={"effort": "minimal"},
-            max_output_tokens=1500,  # room for minimal reasoning + a concise reply
-            store=False,
-        )
-        reply = response.output_text
+        # room for minimal reasoning + a concise reply
+        answer = respond(system_prompt, user_text, max_output_tokens=1500)
     except Exception as e:
-        reply = f"Error: {e}"
+        answer = f"Error: {e}"
 
-    await update.message.reply_text(reply)
+    await update.message.reply_text(answer)
 
 
 # ---------------------------------------------------------------------------

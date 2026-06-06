@@ -4,8 +4,8 @@ Daily pipeline orchestrator.
 Flow:
   1. Run all scrapers IN PARALLEL:
      LinkedIn, Glassdoor, Indeed, Wellfound, RemoteBoards, ATS (13 platforms)
-  2. Phase 1 (fast, sequential): dedup by ID + title+company, junior filter
-  3. Phase 2 (PARALLEL): quick_score + enrich + send Telegram — all jobs at once
+  2. Phase 1 (fast, sequential): dedup by ID + title+company, excluded-title filter
+  3. Phase 2 (PARALLEL): score_job + enrich + send Telegram — all jobs at once
   4. Send daily summary to Telegram
 
 Score threshold configurable via /threshold bot command.
@@ -19,7 +19,6 @@ import os
 import sys
 import json
 import time
-import logging
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -30,6 +29,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import traceback
 
 from db import get_supabase
+from log_setup import get_logger
 import apify_client
 from apify_client import SourceResult
 import run_apify_search
@@ -38,7 +38,7 @@ import run_indeed_search
 import run_wellfound_search
 import run_remoteboards_search
 import run_ats_search
-from score_job import score_job, is_excluded_by_title, cost_from_usage
+from score_job import score_job, is_excluded_by_title, cost_from_usage, DEFAULT_SCORE_THRESHOLD
 from notify_telegram import send_job_card, send_daily_summary, send_message
 
 # Wellfound runs only in this UTC slot (low yield; see plan). None/other slots skip it.
@@ -48,11 +48,7 @@ CROSSRUN_DEDUP_DAYS = 4
 
 load_dotenv()
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Smart deduplication helpers
@@ -171,9 +167,6 @@ DEDUP_SIMILARITY_THRESHOLD = 0.45
 COMPANY_VARIANT_SIM_THRESHOLD = 0.75
 
 
-DEFAULT_SCORE_THRESHOLD = 70
-
-
 # ---------------------------------------------------------------------------
 # Supabase helpers
 # ---------------------------------------------------------------------------
@@ -228,33 +221,20 @@ def _job_row(job: dict, status: str) -> dict:
         "match_summary": job.get("match_summary", ""),
         "red_flags": json.dumps(job.get("red_flags", [])),
         "score_breakdown": json.dumps(job.get("score_breakdown", {})),
-        "fingerprint": _fingerprint(job),
-        "typical_qa": "[]",
+        # Reuse the fingerprint computed in Phase 1 if present (avoids recomputing
+        # the title/company normalisation for every saved row).
+        "fingerprint": job.get("_fingerprint") or _fingerprint(job),
         "status": status,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
 def _upsert_rows(rows: list[dict]) -> None:
-    """Upsert a batch, retrying without optional columns the DB may not have."""
+    """Upsert a batch of job rows. Schema (incl. fingerprint, score_breakdown) is
+    defined in migrations/ and applied once; see migrations/002_*.sql."""
     if not rows:
         return
-    try:
-        get_supabase().table("jobs").upsert(rows).execute()
-        return
-    except Exception as e:
-        msg = str(e)
-        dropped = None
-        for col in ("fingerprint", "score_breakdown"):
-            if col in msg:
-                dropped = col
-                break
-        if not dropped:
-            raise
-        logger.warning(f"'{dropped}' column missing — saving batch without it")
-        for r in rows:
-            r.pop(dropped, None)
-        _upsert_rows(rows)  # retry; may drop another missing column
+    get_supabase().table("jobs").upsert(rows).execute()
 
 
 def save_jobs_batch(rows: list[dict], chunk_size: int = 25) -> None:
@@ -290,7 +270,7 @@ def fetch_recent_fingerprints(fingerprints: list[str], days: int = CROSSRUN_DEDU
     not exist yet (migration not run) — degrades to exact-id dedup only.
     """
     out: dict[str, list[str]] = {}
-    fps = [f for f in {fp for fp in fingerprints} if f and f != "|"]
+    fps = [f for f in set(fingerprints) if f and f != "|"]
     if not fps:
         return out
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
@@ -610,6 +590,7 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
 
             fuzzy_groups.setdefault(dedup_key, []).append(job)
             company_jobs.setdefault(norm_company, []).append(job)
+            job["_fingerprint"] = dedup_key  # cache for _job_row (see I2)
 
             # genuinely new posting
             base = _base_source(job["source"])

@@ -1,5 +1,5 @@
--- Migration 001: observability (pipeline_runs) + cross-run dedup (jobs.fingerprint)
--- Run this once in the Supabase SQL editor (self-hosted Studio).
+-- Migration 002: observability (pipeline_runs) + cross-run dedup (jobs.fingerprint)
+-- Run this once in the Supabase SQL editor (self-hosted Studio), after 001_init.sql.
 -- Safe to re-run: all statements are IF NOT EXISTS / idempotent.
 
 -- 1) Per-run audit log. One row per pipeline run. Every error lands here so it
