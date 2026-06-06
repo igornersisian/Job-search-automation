@@ -234,7 +234,7 @@ def _job_row(job: dict, status: str) -> dict:
         "company": job.get("company", ""),
         "url": job.get("url") or job.get("jobUrl", ""),
         "salary_text": job.get("salary") or job.get("salaryText", ""),
-        "is_remote": True,
+        "is_remote": job.get("is_remote", True),
         "description": job.get("description", "")[:10000],
         "posted_at": job.get("postedAt") or job.get("publishedAt"),
         "score": job.get("score"),
@@ -360,6 +360,7 @@ def normalise_job(raw: dict) -> dict:
         "description": raw.get("description") or "",
         "location": raw.get("location") or "",
         "postedAt": raw.get("postedAt"),
+        "is_remote": raw.get("is_remote", True),
         "source": raw.get("source") or "linkedin",
     }
 

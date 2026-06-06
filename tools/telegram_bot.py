@@ -620,35 +620,46 @@ async def cmd_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show all-time job search statistics."""
+    """Show all-time job search statistics (server-side counts, not a full scan)."""
     try:
         sb = get_supabase()
 
-        # Total processed jobs
-        all_jobs = sb.table("jobs").select("id, status, created_at").execute()
-        rows = all_jobs.data or []
+        def _count(status=None) -> int:
+            # head=True + count=exact → PostgREST returns only the total in
+            # Content-Range, no rows. Avoids pulling 24k+ rows (and silently
+            # capping at the PostgREST row limit) just to count them.
+            q = sb.table("jobs").select("id", count="exact", head=True)
+            if isinstance(status, (list, tuple)):
+                q = q.in_("status", list(status))
+            elif status is not None:
+                q = q.eq("status", status)
+            return q.execute().count or 0
 
-        if not rows:
+        total = _count()
+        if not total:
             await update.message.reply_text("No jobs processed yet.")
             return
 
-        total = len(rows)
-        sent = sum(1 for r in rows if r["status"] == "sent")
-        low_score = sum(1 for r in rows if r["status"] == "low_score")
-        excluded = sum(1 for r in rows if r["status"] in ("filtered_junior", "filtered_excluded"))
-        dupes = sum(1 for r in rows if r["status"] == "duplicate")
-        errors = sum(1 for r in rows if r["status"] in ("score_error", "notify_failed"))
+        sent = _count("sent")
+        low_score = _count("low_score")
+        excluded = _count("filtered_excluded")
+        errors = _count(("score_error", "notify_failed"))
 
-        # Percentage
+        # Per-day averages from the created_at span — two one-row queries instead
+        # of fetching every row to count distinct days.
+        def _edge(newest: bool):
+            r = (sb.table("jobs").select("created_at")
+                 .order("created_at", desc=newest).limit(1).execute().data)
+            return r[0]["created_at"] if r and r[0].get("created_at") else None
+
+        first, last = _edge(False), _edge(True)
+        days_active = 1
+        if first and last:
+            d0 = datetime.fromisoformat(first[:10])
+            d1 = datetime.fromisoformat(last[:10])
+            days_active = max((d1 - d0).days + 1, 1)
+
         pct = (sent / total * 100) if total else 0
-
-        # Count distinct days across ALL jobs
-        all_dates = set()
-        for r in rows:
-            if r.get("created_at"):
-                all_dates.add(r["created_at"][:10])
-
-        days_active = len(all_dates) or 1
         avg_processed = total / days_active
         avg_sent = sent / days_active
 
