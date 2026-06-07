@@ -178,15 +178,40 @@ def get_profile() -> dict | None:
     return None
 
 
+def _supabase_with_retry(fn, *, attempts: int = 3, what: str = "Supabase call"):
+    """Run a Supabase call, retrying transient failures (e.g. self-hosted 502s)
+    with backoff. Re-raises the last error if every attempt fails."""
+    last_err: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last_err = e
+            logger.warning(f"{what} attempt {attempt + 1}/{attempts} failed: {e}")
+            if attempt < attempts - 1:
+                time.sleep(2 * (attempt + 1))
+    raise last_err
+
+
 def fetch_existing_ids(job_ids: list[str]) -> set[str]:
     """Batch-check which job IDs already exist in Supabase.
-    Queries in chunks to avoid URL length limits.
+    Queries in chunks to avoid URL length limits. A transient DB failure that
+    survives retries degrades to no exact-id dedup (the run continues; worst case
+    is a few duplicate cards) — same graceful-degrade stance as
+    fetch_recent_fingerprints.
     """
     existing: set[str] = set()
     chunk_size = 100
     for i in range(0, len(job_ids), chunk_size):
         chunk = job_ids[i : i + chunk_size]
-        result = get_supabase().table("jobs").select("id").in_("id", chunk).execute()
+        try:
+            result = _supabase_with_retry(
+                lambda c=chunk: get_supabase().table("jobs").select("id").in_("id", c).execute(),
+                what="fetch_existing_ids",
+            )
+        except Exception as e:
+            logger.warning(f"Exact-id dedup lookup skipped ({e}) — possible duplicate cards this run")
+            return existing
         existing.update(row["id"] for row in result.data)
     return existing
 
@@ -245,18 +270,10 @@ def save_jobs_batch(rows: list[dict], chunk_size: int = 25) -> None:
     retries (caller treats persistence failure as non-fatal)."""
     for i in range(0, len(rows), chunk_size):
         chunk = rows[i : i + chunk_size]
-        last_err: Exception | None = None
-        for attempt in range(3):
-            try:
-                _upsert_rows(chunk)
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-                logger.warning(f"Batch upsert chunk {i // chunk_size} attempt {attempt + 1} failed: {e}")
-                time.sleep(2 * (attempt + 1))
-        if last_err is not None:
-            raise last_err
+        _supabase_with_retry(
+            lambda c=chunk: _upsert_rows(c),
+            what=f"Batch upsert chunk {i // chunk_size}",
+        )
 
 
 def save_job(job: dict, status: str) -> None:
@@ -278,12 +295,15 @@ def fetch_recent_fingerprints(fingerprints: list[str], days: int = CROSSRUN_DEDU
     try:
         for i in range(0, len(fps), chunk_size):
             chunk = fps[i : i + chunk_size]
-            res = (
-                get_supabase().table("jobs")
-                .select("fingerprint,description")
-                .in_("fingerprint", chunk)
-                .gte("created_at", cutoff)
-                .execute()
+            res = _supabase_with_retry(
+                lambda c=chunk: (
+                    get_supabase().table("jobs")
+                    .select("fingerprint,description")
+                    .in_("fingerprint", c)
+                    .gte("created_at", cutoff)
+                    .execute()
+                ),
+                what="fetch_recent_fingerprints",
             )
             for row in res.data:
                 fp = row.get("fingerprint")
