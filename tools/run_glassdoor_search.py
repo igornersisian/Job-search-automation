@@ -57,7 +57,7 @@ def normalise_glassdoor(raw: dict) -> dict:
         "description": raw.get("description") or "",
         "location": location_str,
         "postedAt": posted_at,
-        "is_remote": False,
+        "is_remote": True,  # we now query remoteWorkType=True, so only remote jobs come back
         "source": "glassdoor",
     }
 
@@ -67,7 +67,11 @@ def fetch(keywords: list[str], *, lookback: int = 86400) -> apify_client.SourceR
     days_old = max(1, math.ceil(lookback / 86400))  # whole days; min 1
     return apify_client.fan_out_keywords(
         ACTOR_ID, keywords,
-        lambda kw: {"keywords": kw, "location": "United States", "daysOld": days_old, "limit": LIMIT},
+        # remoteWorkType=True: only remote jobs. Without it Glassdoor returned ALL
+        # US jobs (incl. on-site/hybrid), which flooded scoring with auto-0 location
+        # mismatches and made it hit the cap. Filtering at source = fewer, relevant.
+        lambda kw: {"keywords": kw, "location": "United States", "daysOld": days_old,
+                    "limit": LIMIT, "remoteWorkType": True},
         source="glassdoor", normalise=normalise_glassdoor, cap=LIMIT,
     )
 

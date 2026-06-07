@@ -60,6 +60,11 @@ def fetch(keywords: list[str], *, lookback: int = 86400) -> apify_client.SourceR
         "keyword": keywords,
         "publishedAt": _published_at(lookback),   # enum-only; 24h minimum
         "workType": ["remote"],
+        # Source-side seniority filter: keep everything up to mid-senior, drop only
+        # the clearly-too-senior tier (director). Recall-safe — mid-senior still
+        # includes the 2-4yr roles that actually match; scoring handles the rest.
+        "experienceLevel": ["internship", "entry-level", "associate", "mid-senior"],
+        "jobType": ["full-time", "contract"],
         "maxItems": MAX_ITEMS,
         "saveOnlyUniqueItems": True,
     }
