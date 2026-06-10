@@ -54,6 +54,11 @@ _CREDIT_ERROR_SUBSTRINGS = (
     "no-available-resources",
     "payment",
     "billing",
+    # Free-tier account with $0 remaining: Apify caps the run's max charge at $0
+    # and rejects the START with HTTP 400 (not 402/403), e.g.
+    # 'max-total-charge-usd-must-be-greater-than-zero'. Same meaning: rotate token.
+    "max-total-charge",
+    "maximum cost per run",
 )
 
 
@@ -151,10 +156,19 @@ def mark_exhausted(index: int, reason: str = "") -> None:
 
 
 def is_credit_error(status_code: int, body: str) -> bool:
-    """True if the response looks like an out-of-credit / quota failure."""
+    """True if the response looks like an out-of-credit / quota failure.
+
+    Covers the free-tier HTTP 400 'max-total-charge-usd-must-be-greater-than-zero':
+    once an account's credit is spent, Apify caps the max charge per run at $0 and
+    rejects the run START with 400 (not 402/403). We must treat it as exhaustion so
+    the runner rotates to the next token instead of failing the whole source — other
+    400s (bad input) are NOT credit errors, so we match the specific message only.
+    """
+    body_lower = (body or "").lower()
+    if status_code == 400 and "max-total-charge" in body_lower:
+        return True
     if status_code not in (402, 403):
         return False
-    body_lower = (body or "").lower()
     return any(s in body_lower for s in _CREDIT_ERROR_SUBSTRINGS)
 
 
