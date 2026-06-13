@@ -61,6 +61,16 @@ _CREDIT_ERROR_SUBSTRINGS = (
     "maximum cost per run",
 )
 
+# HTTP-400 error-type substrings that mean "free-tier credit spent" rather than
+# "bad input". When an account hits $0, Apify rejects the run START with a 400
+# whose type depends on the actor's pricing model (see is_credit_error). We never
+# send a zero cap ourselves, so matching these can't be confused with real input
+# errors. Kept separate from _CREDIT_ERROR_SUBSTRINGS because those gate 402/403.
+_CREDIT_ERROR_400_TYPES = (
+    "max-total-charge",                    # max-charge actors
+    "max-items-must-be-greater-than-zero", # pay-per-result actors
+)
+
 
 def _load_tokens() -> list[str]:
     """Return tokens in slot order: APIFY_API_TOKEN, APIFY_API_TOKEN2, ..."""
@@ -158,14 +168,18 @@ def mark_exhausted(index: int, reason: str = "") -> None:
 def is_credit_error(status_code: int, body: str) -> bool:
     """True if the response looks like an out-of-credit / quota failure.
 
-    Covers the free-tier HTTP 400 'max-total-charge-usd-must-be-greater-than-zero':
-    once an account's credit is spent, Apify caps the max charge per run at $0 and
-    rejects the run START with 400 (not 402/403). We must treat it as exhaustion so
-    the runner rotates to the next token instead of failing the whole source — other
-    400s (bad input) are NOT credit errors, so we match the specific message only.
+    Covers two free-tier HTTP 400 exhaustion shapes — once an account's credit is
+    spent, Apify caps the run's affordable charge at $0 and rejects the START with
+    400 (not 402/403), so the runner must rotate to the next token instead of
+    failing the whole source. The exact error type depends on the actor's pricing:
+      - max-charge actors: 'max-total-charge-usd-must-be-greater-than-zero'
+      - pay-per-result actors: 'max-items-must-be-greater-than-zero'
+        ("Maximum charged results must be greater than zero")
+    Other 400s (genuine bad input) are NOT credit errors — we match these specific
+    types only, and we never send a zero cap ourselves, so this can't misfire.
     """
     body_lower = (body or "").lower()
-    if status_code == 400 and "max-total-charge" in body_lower:
+    if status_code == 400 and any(s in body_lower for s in _CREDIT_ERROR_400_TYPES):
         return True
     if status_code not in (402, 403):
         return False
