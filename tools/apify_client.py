@@ -39,6 +39,12 @@ logger = logging.getLogger(__name__)
 
 STATE_FILE = Path(".tmp") / "apify_token_state.json"
 
+# Transient 'actor-memory-limit-exceeded' on start: how many times to wait-and-retry
+# before giving up on this source, and the linear back-off step (seconds). Total
+# wait at defaults: 15 + 30 + 45 = 90s, well inside the per-source start window.
+MEMORY_LIMIT_RETRIES = 4
+MEMORY_LIMIT_BACKOFF = 15
+
 # Substrings that indicate the response failed because the account is out
 # of credit / quota — i.e. rotation should help.
 _CREDIT_ERROR_SUBSTRINGS = (
@@ -183,7 +189,28 @@ def is_credit_error(status_code: int, body: str) -> bool:
         return True
     if status_code not in (402, 403):
         return False
+    # A full concurrent-memory cap also returns 402 and contains the word
+    # "exceeded" — but it is transient, NOT out-of-credit. Treating it as a
+    # credit error wrongly marks a FUNDED token exhausted, and with the parallel
+    # fan-out that cascades into "all slots unavailable" and a 0-job pipeline.
+    if is_memory_limit_error(status_code, body):
+        return False
     return any(s in body_lower for s in _CREDIT_ERROR_SUBSTRINGS)
+
+
+def is_memory_limit_error(status_code: int, body: str) -> bool:
+    """True if the run START was rejected because the account's total concurrent
+    Actor memory cap (free tier: 8192 MB) is momentarily full — Apify returns
+    HTTP 402 type 'actor-memory-limit-exceeded'.
+
+    This is TRANSIENT, not a credit failure: our parallel fan-out launches several
+    actors at once on the *same* (first funded) token, so the cap frees up as those
+    runs finish. The runner waits-and-retries instead of burning the token.
+    """
+    if status_code not in (402, 429):
+        return False
+    b = (body or "").lower()
+    return "memory-limit" in b or "memory limit" in b
 
 
 def is_invalid_token_error(status_code: int, body: str) -> bool:
@@ -405,11 +432,36 @@ def run_actor_job(
         res.attempts = attempt
 
         # ---- start (post() rotates internally on start-credit errors) ----
-        try:
-            resp, token = post(runs_url, json_body=actor_input, timeout=30)
-        except Exception as e:  # network/all-exhausted
-            res.error = f"start failed: {e}"
+        # A full concurrent-memory cap (HTTP 402 'actor-memory-limit-exceeded') is
+        # transient — wait-and-retry on the same token rather than failing the
+        # source. post() already left the token unburned (not a credit error).
+        resp = None
+        token = ""
+        for mem_try in range(1, MEMORY_LIMIT_RETRIES + 1):
+            try:
+                resp, token = post(runs_url, json_body=actor_input, timeout=30)
+            except Exception as e:  # network/all-exhausted
+                res.error = f"start failed: {e}"
+                resp = None
+                break
+            if not is_memory_limit_error(resp.status_code, resp.text):
+                break  # success or some other error — handled below
+            if mem_try < MEMORY_LIMIT_RETRIES:
+                wait = MEMORY_LIMIT_BACKOFF * mem_try
+                logger.warning(
+                    f"[{source}] Apify memory cap full on start "
+                    f"(try {mem_try}/{MEMORY_LIMIT_RETRIES}) — waiting {wait}s to retry"
+                )
+                time.sleep(wait)
+                continue
+            res.error = (
+                f"start HTTP {resp.status_code} (memory cap still full after "
+                f"{mem_try} tries): {_redact((resp.text or '')[:300])}"
+            )
+            resp = None
             break
+        if resp is None:
+            break  # network/all-exhausted/memory give-up — error already set
         if resp.status_code >= 400:
             res.error = f"start HTTP {resp.status_code}: {_redact((resp.text or '')[:400])}"
             break
