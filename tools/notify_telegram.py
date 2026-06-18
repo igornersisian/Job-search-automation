@@ -157,6 +157,8 @@ def send_daily_summary(
     total_cost: float | None = None,
     openai_cost: float | None = None,
     openai_calls: int | None = None,
+    scoring_errors: int = 0,
+    scoring_error_sample: str | None = None,
 ) -> None:
     """Send a brief pipeline summary, including a per-source breakdown.
 
@@ -193,6 +195,12 @@ def send_daily_summary(
         f"♻️ Duplicates skipped: {skipped_dupe}{dupe_detail}"
     )
 
+    # Scoring failures are NOT fetch errors — surface them loudly here, otherwise a
+    # run where every LLM call fails (e.g. OpenAI out of credit) looks like a calm
+    # "0 sent" no-op. The real error is sent as a follow-up plain-text message.
+    if scoring_errors:
+        text += f"\n🛑 *Scoring failed: {scoring_errors}* — not scored (see error below)"
+
     # Per-source breakdown: fetched / new / sent (+ cost, cap flag)
     if per_source:
         lines = []
@@ -228,6 +236,16 @@ def send_daily_summary(
                 _send_chunked(f"⚠️ {name} failed:\n\n{err}", parse_mode=None)
             except Exception as e:
                 logger.error(f"Failed to send error detail for {name}: {e}")
+
+    if scoring_errors and scoring_error_sample:
+        try:
+            _send_chunked(
+                f"🛑 Scoring failed for {scoring_errors} job(s) — none were scored.\n"
+                f"Usually the LLM account is out of credit/quota.\n\nExample error:\n{scoring_error_sample}",
+                parse_mode=None,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send scoring-error detail: {e}")
 
 
 if __name__ == "__main__":

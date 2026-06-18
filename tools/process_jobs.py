@@ -418,6 +418,9 @@ def _process_single_job(job: dict, profile: dict, threshold: int) -> tuple[dict,
         score_job(job, profile)  # mutates job in place: score, match_summary, red_flags, _usage
     except Exception as e:
         logger.error(f"Scoring failed for {job['title']}: {e}")
+        # Stash the real exception so the audit log + Telegram alert show WHY
+        # scoring failed (e.g. OpenAI insufficient_quota), not just the title.
+        job["_score_error"] = f"{type(e).__name__}: {str(e)[:400]}"
         return job, "score_error"
 
     score = job.get("score", 0)
@@ -636,6 +639,8 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
         sent = 0
         skipped_score = 0
         errors = 0
+        score_errors = 0                       # scoring (LLM) failures specifically
+        score_error_sample: str | None = None  # one real error, surfaced in Telegram
 
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {executor.submit(_process_single_job, job, profile, threshold): job for job in candidates}
@@ -658,7 +663,23 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
                     skipped_score += 1
                 elif status in ("notify_failed", "score_error"):
                     errors += 1
-                    errors_log.append({"source": base, "stage": status, "message": f"{job.get('title','')[:80]}"})
+                    if status == "score_error":
+                        score_errors += 1
+                        if score_error_sample is None:
+                            score_error_sample = job.get("_score_error", "")
+                    detail = job.get("_score_error") or job.get("title", "")[:80]
+                    errors_log.append({"source": base, "stage": status, "message": str(detail)[:400]})
+
+        # Scoring fully broke (candidates existed but NONE were scored) — usually
+        # OpenAI/OpenRouter out of credit. Flag the run not-ok so the audit log
+        # reflects it, even though fetch + save succeeded.
+        if candidates and openai_usage["calls"] == 0:
+            ok = False
+            logger.error(
+                f"All {len(candidates)} candidates failed scoring "
+                f"({score_errors} score errors) — likely LLM credit/quota. "
+                f"Sample: {score_error_sample}"
+            )
 
         # batch-save everything at once (was hundreds of per-job upserts).
         # Persistence failure is non-fatal: cards were already sent, and the run
@@ -708,6 +729,8 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
             total_cost=total_cost,
             openai_cost=openai_cost,
             openai_calls=openai_usage["calls"],
+            scoring_errors=score_errors,
+            scoring_error_sample=score_error_sample,
         )
 
     except Exception:
