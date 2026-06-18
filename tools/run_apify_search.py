@@ -20,8 +20,19 @@ load_dotenv()
 logger = get_logger(__name__)
 
 ACTOR_ID = "2rJKkhh7vjpX7pvjg"  # cheap_scraper/linkedin-job-scraper
-MAX_ITEMS = 400                 # our cap → also the truncation threshold
+MAX_ITEMS = 400                 # our cap → also the truncation threshold.
                                 # (raised 150→400 to stop truncating the 24h window)
+                                # NOTE: the actor now enforces maxItems >= 150 —
+                                # going below silently fails the START (HTTP 400).
+
+# The actor builds its LinkedIn search URL from keyword + location. Around
+# 2026-06-17 it started REQUIRING a location: with none, it logs "No valid start
+# URLs could be constructed from the input" and returns 0 results while the run
+# still reports SUCCEEDED — so the pipeline saw "0 fetched, no error" for days.
+# "United States" matches the rest of the pipeline (Glassdoor uses the same);
+# workType=remote still filters to remote within it. Confirmed by A/B test
+# 2026-06-19: no location → 0 jobs; + this location → full 400.
+SEARCH_LOCATIONS = ["United States"]
 
 
 def _published_at(lookback: int) -> str:
@@ -58,6 +69,7 @@ def fetch(keywords: list[str], *, lookback: int = 86400) -> apify_client.SourceR
     """Run the LinkedIn actor for the given keywords over the lookback window."""
     actor_input = {
         "keyword": keywords,
+        "locations": SEARCH_LOCATIONS,            # REQUIRED by the actor to build URLs
         "publishedAt": _published_at(lookback),   # enum-only; 24h minimum
         "workType": ["remote"],
         # Source-side seniority filter: keep everything up to mid-senior, drop only
