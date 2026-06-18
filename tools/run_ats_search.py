@@ -30,6 +30,16 @@ PAGE_SIZE = 100                 # results per page (actor max)
 MAX_PAGES = 3                   # ceiling → up to 300 results/run before we stop
 MAX_QUERIES = 5                 # actor rejects >5 (HTTP 400)
 
+# The actor filters `posted_after` against each job's date_posted. The big ATS
+# platforms (greenhouse, lever, workday, workable, ashby, comeet, gem...) surface
+# jobs whose date_posted is days/weeks old, so the pipeline's ~7h global window
+# excludes almost all of them — leaving only a few future-dated zohorecruit/icims
+# entries. Confirmed 2026-06-19: 7h window → 13 jobs (zohorecruit/icims only);
+# 120-day window → greenhouse/lever/workday/workable return. So ATS uses its OWN
+# wide window; cross-run dedup (exact-id + 4-day fuzzy) stops re-sending the
+# backlog. This is the source of pay-per-result cost, so it's a deliberate knob.
+ATS_LOOKBACK_DAYS = 30
+
 
 def normalise_ats(raw: dict) -> dict:
     """Map ATS Jobs Search output to the shared job schema."""
@@ -75,7 +85,10 @@ def fetch(keywords: list[str], *, lookback: int = 86400) -> apify_client.SourceR
     paginating until a page comes back not-full (window exhausted) or we hit
     MAX_PAGES. `capped` on the merged result means we stopped at the ceiling
     with a still-full last page — i.e. there were more we didn't fetch."""
-    since = (datetime.now(timezone.utc) - timedelta(seconds=lookback)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # ATS deliberately ignores the caller's ~7h `lookback` and uses its own wide
+    # window — the actor's date filter would otherwise drop the major platforms
+    # (see ATS_LOOKBACK_DAYS). Cross-run dedup prevents re-sending the backlog.
+    since = (datetime.now(timezone.utc) - timedelta(days=ATS_LOOKBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     base = {
         "queries": keywords[:MAX_QUERIES],
         "is_remote": True,
