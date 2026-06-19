@@ -262,18 +262,77 @@ def _upsert_rows(rows: list[dict]) -> None:
     get_supabase().table("jobs").upsert(rows).execute()
 
 
-def save_jobs_batch(rows: list[dict], chunk_size: int = 25) -> None:
-    """Batch-upsert job rows in chunks (replaces hundreds of per-job round-trips).
+def _present_ids(ids: list[str]) -> set[str]:
+    """Which of `ids` are currently rows in `jobs`. Raises on DB failure (so the
+    caller can tell 'genuinely missing' apart from 'couldn't verify')."""
+    present: set[str] = set()
+    for i in range(0, len(ids), 100):
+        chunk = ids[i : i + 100]
+        res = _supabase_with_retry(
+            lambda c=chunk: get_supabase().table("jobs").select("id").in_("id", c).execute(),
+            what="verify save",
+        )
+        present.update(row["id"] for row in res.data)
+    return present
+
+
+def save_jobs_batch(rows: list[dict], chunk_size: int = 25) -> list[str]:
+    """Batch-upsert job rows in chunks, then VERIFY they actually landed.
 
     Smaller chunks + per-chunk retry keep large writes under the client timeout
     on a flaky/remote DB connection. Raises only if a chunk still fails after
-    retries (caller treats persistence failure as non-fatal)."""
+    retries (caller treats persistence failure as non-fatal).
+
+    The self-hosted DB has been observed to ACCEPT an upsert (HTTP 2xx, no error)
+    yet silently not persist a large fraction of the rows — a partial save that
+    left the run reporting ok=True while the next run, finding nothing to dedup
+    against, RE-SENT the dropped jobs (confirmed 2026-06-19: 156/216 ATS rows
+    lost, 6 cards re-sent 6h later). So after writing we re-read the ids, re-drive
+    whatever is missing in smaller chunks, and RETURN the ids still absent so the
+    caller can flag the run not-ok and surface it instead of swallowing the loss.
+    """
+    if not rows:
+        return []
     for i in range(0, len(rows), chunk_size):
         chunk = rows[i : i + chunk_size]
         _supabase_with_retry(
             lambda c=chunk: _upsert_rows(c),
             what=f"Batch upsert chunk {i // chunk_size}",
         )
+
+    intended = [r["id"] for r in rows if r.get("id")]
+    if not intended:
+        return []
+    try:
+        missing = set(intended) - _present_ids(intended)
+    except Exception as e:
+        # Can't verify (DB unreachable) — don't false-alarm; the chunk writes
+        # above already succeeded or this whole function would have raised.
+        logger.warning(f"Save verification skipped ({e})")
+        return []
+
+    if missing:
+        logger.warning(
+            f"Save verify: {len(missing)}/{len(intended)} rows not persisted on "
+            f"first pass — re-driving in small chunks"
+        )
+        retry_rows = [r for r in rows if r.get("id") in missing]
+        for i in range(0, len(retry_rows), 10):
+            chunk = retry_rows[i : i + 10]
+            try:
+                _supabase_with_retry(
+                    lambda c=chunk: _upsert_rows(c),
+                    what=f"Save retry chunk {i // 10}",
+                )
+            except Exception as e:
+                logger.error(f"Save retry chunk failed (continuing): {e}")
+        try:
+            missing = set(intended) - _present_ids(intended)
+        except Exception as e:
+            logger.warning(f"Save re-verification skipped ({e})")
+            return []
+
+    return sorted(missing)
 
 
 def save_job(job: dict, status: str) -> None:
@@ -682,14 +741,26 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
             )
 
         # batch-save everything at once (was hundreds of per-job upserts).
-        # Persistence failure is non-fatal: cards were already sent, and the run
-        # outcome is still recorded in pipeline_runs below.
+        # Persistence failure is non-fatal for THIS run (cards were already sent),
+        # but a SILENT partial save makes the NEXT run re-send the dropped jobs —
+        # so save_jobs_batch verifies the write and returns any ids still missing.
+        save_verify_error: str | None = None
         try:
-            save_jobs_batch(rows_to_save)
+            missing_ids = save_jobs_batch(rows_to_save)
         except Exception as e:
             logger.error(f"Batch save failed (continuing): {e}")
             errors_log.append({"source": "supabase", "stage": "save_jobs", "message": str(e)[:300]})
             ok = False
+            missing_ids = []
+        if missing_ids:
+            ok = False
+            save_verify_error = (
+                f"{len(missing_ids)}/{len(rows_to_save)} job rows did NOT persist "
+                f"after retry — the next run may RE-SEND these as 'new'. "
+                f"Sample ids: {missing_ids[:5]}"
+            )
+            logger.error(f"Save verification: {save_verify_error}")
+            errors_log.append({"source": "supabase", "stage": "save_verify", "message": save_verify_error})
 
         openai_cost = round(openai_usage["cost_usd"], 4)
         totals = {
@@ -715,6 +786,8 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
         )
 
         source_errors = {name: p["error"] for name, p in per_source.items() if p["error"]}
+        if save_verify_error:
+            source_errors["supabase (save)"] = save_verify_error
         send_daily_summary(
             sent=sent,
             skipped_score=skipped_score,
