@@ -195,10 +195,12 @@ def _supabase_with_retry(fn, *, attempts: int = 3, what: str = "Supabase call"):
 
 def fetch_existing_ids(job_ids: list[str]) -> set[str]:
     """Batch-check which job IDs already exist in Supabase.
-    Queries in chunks to avoid URL length limits. A transient DB failure that
-    survives retries degrades to no exact-id dedup (the run continues; worst case
-    is a few duplicate cards) — same graceful-degrade stance as
-    fetch_recent_fingerprints.
+    Queries in chunks to avoid URL length limits. A transient DB failure on one
+    chunk is logged and SKIPPED for that chunk only — it must NOT abandon the
+    remaining chunks (the old `return existing` did, so one flaky chunk silently
+    disabled exact-id dedup for every id after it → re-sends; confirmed 2026-06-19).
+    The per-send guard in _process_single_job is the final backstop against any
+    duplicate that still slips through a degraded read here.
     """
     existing: set[str] = set()
     chunk_size = 100
@@ -210,8 +212,11 @@ def fetch_existing_ids(job_ids: list[str]) -> set[str]:
                 what="fetch_existing_ids",
             )
         except Exception as e:
-            logger.warning(f"Exact-id dedup lookup skipped ({e}) — possible duplicate cards this run")
-            return existing
+            logger.warning(
+                f"Exact-id dedup chunk {i // chunk_size} failed ({e}) — continuing; "
+                f"send-guard still covers these"
+            )
+            continue
         existing.update(row["id"] for row in result.data)
     return existing
 
@@ -351,9 +356,12 @@ def fetch_recent_fingerprints(fingerprints: list[str], days: int = CROSSRUN_DEDU
         return out
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     chunk_size = 100
-    try:
-        for i in range(0, len(fps), chunk_size):
-            chunk = fps[i : i + chunk_size]
+    # Per-chunk try/continue: a transient failure on one chunk must only drop
+    # that chunk, not return {} and disable cross-run fuzzy for the WHOLE run
+    # (the old behaviour — one flaky read silently nuked all fuzzy dedup → re-sends).
+    for i in range(0, len(fps), chunk_size):
+        chunk = fps[i : i + chunk_size]
+        try:
             res = _supabase_with_retry(
                 lambda c=chunk: (
                     get_supabase().table("jobs")
@@ -364,13 +372,16 @@ def fetch_recent_fingerprints(fingerprints: list[str], days: int = CROSSRUN_DEDU
                 ),
                 what="fetch_recent_fingerprints",
             )
-            for row in res.data:
-                fp = row.get("fingerprint")
-                if fp:
-                    out.setdefault(fp, []).append(row.get("description") or "")
-    except Exception as e:
-        logger.warning(f"Cross-run fingerprint lookup skipped ({e}) — exact-id dedup only")
-        return {}
+        except Exception as e:
+            logger.warning(
+                f"Cross-run fingerprint chunk {i // chunk_size} failed ({e}) — "
+                f"continuing; send-guard still covers these"
+            )
+            continue
+        for row in res.data:
+            fp = row.get("fingerprint")
+            if fp:
+                out.setdefault(fp, []).append(row.get("description") or "")
     return out
 
 
@@ -466,6 +477,59 @@ def _fetch_all_sources(
 # Single-job processor (runs inside thread pool)
 # ---------------------------------------------------------------------------
 
+def _already_persisted(job: dict) -> bool | None:
+    """Final cross-run dedup guard, run right before the costly/visible SEND.
+
+    The bulk Phase-1 dedup reads degrade silently-OPEN under DB flakiness (a
+    flaky chunk → ids look unseen → re-send; confirmed 2026-06-19, ATS cards
+    re-sent though their rows were already in the DB). At send time nothing from
+    THIS run is persisted yet, so any row matching this job's id or fingerprint
+    can only come from a PRIOR run — i.e. a genuine cross-run duplicate.
+
+    Returns True (already in DB → skip send), False (genuinely new → send), or
+    None (DB unreachable after strong retry → caller fails open). Two cheap
+    indexed lookups, only for the ≤~15 jobs that clear the score threshold.
+    """
+    jid = job.get("id")
+    fp = job.get("_fingerprint") or _fingerprint(job)
+    desc = job.get("description", "") or ""
+    try:
+        # 1) Exact id — literally the same posting (any time). Safe, and it's what
+        #    catches the confirmed re-send case: ATS ids are stable, so the prior
+        #    run's row is already here under the same id.
+        if jid:
+            r = _supabase_with_retry(
+                lambda: get_supabase().table("jobs").select("id").eq("id", jid).limit(1).execute(),
+                attempts=5, what="send-guard id",
+            )
+            if r.data:
+                return True
+        # 2) Fuzzy — same fingerprint within the cross-run window AND a similar (or
+        #    empty) description. Mirrors fetch_recent_fingerprints + the Phase-1
+        #    fuzzy check exactly, so the guard is never MORE aggressive than the
+        #    bulk dedup it backs up (won't suppress a genuinely new posting that
+        #    merely shares title+company with an old one).
+        if fp and fp != "|":
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=CROSSRUN_DEDUP_DAYS)).isoformat()
+            r = _supabase_with_retry(
+                lambda: (
+                    get_supabase().table("jobs").select("description")
+                    .eq("fingerprint", fp).gte("created_at", cutoff).limit(20).execute()
+                ),
+                attempts=5, what="send-guard fingerprint",
+            )
+            for row in r.data:
+                other = row.get("description") or ""
+                if not other or not desc:
+                    return True
+                if _description_similarity(desc, other) >= DEDUP_SIMILARITY_THRESHOLD:
+                    return True
+        return False
+    except Exception as e:
+        logger.warning(f"Send-guard DB check failed for {job.get('title')!r} ({e}) — sending anyway")
+        return None
+
+
 def _process_single_job(job: dict, profile: dict, threshold: int) -> tuple[dict, str]:
     """Score + analyse + send one job. Returns (job, status_label).
 
@@ -487,6 +551,12 @@ def _process_single_job(job: dict, profile: dict, threshold: int) -> tuple[dict,
 
     if score < threshold:
         return job, "low_score"
+
+    # Final dedup guard before sending: catches cross-run duplicates that a
+    # degraded bulk read missed, so the DB flakiness can't spam re-sends.
+    if _already_persisted(job) is True:
+        logger.info(f"[DEDUP-SEND] already in DB, skip re-send: {job['title']} @ {job['company']}")
+        return job, "dupe_late"
 
     # Send to Telegram
     if send_job_card(job):
@@ -700,6 +770,7 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
         errors = 0
         score_errors = 0                       # scoring (LLM) failures specifically
         score_error_sample: str | None = None  # one real error, surfaced in Telegram
+        dupes_send_guard = 0                    # cross-run dupes caught at send time
 
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {executor.submit(_process_single_job, job, profile, threshold): job for job in candidates}
@@ -718,6 +789,10 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
                     sent += 1
                     if base in per_source:
                         per_source[base]["sent"] += 1
+                elif status == "dupe_late":
+                    # passed the bulk dedup read (which was degraded) but the
+                    # send-guard found it already in the DB → a re-send we stopped
+                    dupes_send_guard += 1
                 elif status == "low_score":
                     skipped_score += 1
                 elif status in ("notify_failed", "score_error"):
@@ -739,6 +814,15 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
                 f"({score_errors} score errors) — likely LLM credit/quota. "
                 f"Sample: {score_error_sample}"
             )
+
+        # Cross-run dupes the send-guard caught are real dedup hits the bulk read
+        # missed (degraded DB) — count them so the summary reflects reality.
+        if dupes_send_guard:
+            logger.warning(
+                f"Send-guard caught {dupes_send_guard} cross-run duplicate(s) the "
+                f"bulk dedup read missed (degraded DB) — these were NOT re-sent"
+            )
+        skipped_dupe += dupes_send_guard
 
         # batch-save everything at once (was hundreds of per-job upserts).
         # Persistence failure is non-fatal for THIS run (cards were already sent),
@@ -777,6 +861,7 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
                 "completion": openai_usage["completion_tokens"],
             },
             "total_cost_usd": round(total_cost + openai_cost, 4),
+            "dupes_send_guard": dupes_send_guard,
         }
         logger.info(
             f"Pipeline done — sent: {sent}, low score: {skipped_score}, "
@@ -793,7 +878,7 @@ def run_pipeline(lookback: int | None = None, slot: str | None = None) -> None:
             skipped_score=skipped_score,
             skipped_excluded=skipped_excluded,
             skipped_dupe=skipped_dupe,
-            dupes_crossrun=dupes_crossrun + dupes_crossrun_fuzzy,
+            dupes_crossrun=dupes_crossrun + dupes_crossrun_fuzzy + dupes_send_guard,
             dupes_local=dupes_local,
             dupes_fuzzy=dupes_fuzzy,
             threshold=threshold,
